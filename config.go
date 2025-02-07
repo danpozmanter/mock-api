@@ -16,10 +16,8 @@ type Config struct {
 	Latency LatencyConfig `yaml:"latency"`
 	// Override responses for specific endpoints.
 	Responses map[string]interface{} `yaml:"responses"`
-	// The error response (code and JSON body) to use when simulating a failure.
+	// ErrorResponse now contains the error code, body, and frequency.
 	ErrorResponse ErrorResponseConfig `yaml:"error_response"`
-	// With what frequency (0–1) should a request fail?
-	ErrorFrequency float64 `yaml:"error_frequency"`
 	// Prefix to insert before each endpoint URL. Defaults to "v1" if not provided.
 	Prefix string `yaml:"prefix"`
 }
@@ -32,10 +30,11 @@ type LatencyConfig struct {
 	LowFrequency float64 `yaml:"low_frequency"`
 }
 
-// ErrorResponseConfig specifies an HTTP code and a JSON body.
+// ErrorResponseConfig now includes Frequency.
 type ErrorResponseConfig struct {
-	Code int         `yaml:"code"`
-	Body interface{} `yaml:"body"`
+	Code      int         `yaml:"code"`
+	Body      interface{} `yaml:"body"`
+	Frequency float64     `yaml:"frequency"`
 }
 
 // loadConfig reads and parses the YAML config file and returns an error if any required field is missing.
@@ -77,8 +76,8 @@ func checkMissingConfig(config *Config) []string {
 	if config.Latency.LowFrequency == 0 {
 		missing = append(missing, "latency.low_frequency")
 	}
-	if config.ErrorFrequency == 0 {
-		missing = append(missing, "error_frequency")
+	if config.ErrorResponse.Frequency == 0 {
+		missing = append(missing, "error_response.frequency")
 	}
 	if config.ErrorResponse.Code == 0 {
 		missing = append(missing, "error_response.code")

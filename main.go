@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"flag"
 	"log"
 	"net/http"
@@ -32,13 +33,22 @@ func main() {
 	// Create router.
 	router := mux.NewRouter().StrictSlash(true)
 
+	// Store valid methods for each path
+	pathMethods := make(map[string]map[string]bool)
+
 	// Register each endpoint from the spec with the provided prefix.
 	for path, methods := range spec.Paths {
+		trimmedPrefix := strings.Trim(config.Prefix, "/")
+		trimmedPath := strings.TrimLeft(path, "/")
+		fullPath := "/" + trimmedPrefix + "/" + trimmedPath
+
+		// Store valid methods for this path
+		pathMethods[fullPath] = make(map[string]bool)
+
 		for method := range methods {
-			trimmedPrefix := strings.Trim(config.Prefix, "/")
-			trimmedPath := strings.TrimLeft(path, "/")
-			fullPath := "/" + trimmedPrefix + "/" + trimmedPath
 			httpMethod := strings.ToUpper(method)
+			pathMethods[fullPath][httpMethod] = true
+
 			// Capture fullPath in closure.
 			ep := fullPath
 			router.HandleFunc(ep, func(w http.ResponseWriter, r *http.Request) {
@@ -46,12 +56,28 @@ func main() {
 			}).Methods(httpMethod)
 			log.Printf("Registered endpoint: %s %s", httpMethod, fullPath)
 		}
+
+		// Add a handler for unsupported methods on valid paths
+		ep := fullPath
+		router.HandleFunc(ep, func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			json.NewEncoder(w).Encode(ErrorResponse{
+				Error: "Method not allowed",
+			})
+		})
 	}
 
-	// Catch-all handler.
+	// Catch-all handler for unknown paths
 	router.NotFoundHandler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		http.Error(w, "Not Found", http.StatusNotFound)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusNotFound)
+		json.NewEncoder(w).Encode(ErrorResponse{
+			Error: "Not found",
+		})
 	})
+
+	log.Printf("Loaded responses: %+v", config.Responses)
 
 	addr := ":" + *port
 	log.Printf("Starting server on %s", addr)

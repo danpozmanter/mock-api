@@ -6,8 +6,14 @@ import (
 	"log"
 	"math/rand"
 	"net/http"
+	"strings"
 	"time"
 )
+
+// ErrorResponse represents a standardized error response
+type ErrorResponse struct {
+	Error string `json:"error"`
+}
 
 // handleRequest simulates latency, random failures, and returns the (possibly overridden)
 // response. It also streams if the query parameter stream=true is present.
@@ -18,7 +24,7 @@ func handleRequest(w http.ResponseWriter, r *http.Request, path string, config *
 	time.Sleep(time.Duration(chosenLatency) * time.Millisecond)
 
 	// Possibly simulate an error.
-	if rand.Float64() < config.ErrorFrequency {
+	if rand.Float64() < config.ErrorResponse.Frequency {
 		simulateError(w, r, config)
 		return
 	}
@@ -39,6 +45,16 @@ func chooseLatency(config *Config) int {
 	return config.Latency.High
 }
 
+func sendJSONError(w http.ResponseWriter, code int, message string) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(code)
+	if err := json.NewEncoder(w).Encode(ErrorResponse{Error: message}); err != nil {
+		log.Printf("Error encoding error response: %v", err)
+		// If JSON encoding fails, send a minimal JSON error
+		w.Write([]byte(`{"error":"Internal server error"}`))
+	}
+}
+
 // simulateError writes an error response, streaming if requested.
 func simulateError(w http.ResponseWriter, r *http.Request, config *Config) {
 	log.Printf("Simulating error for request")
@@ -57,10 +73,56 @@ func simulateError(w http.ResponseWriter, r *http.Request, config *Config) {
 
 // getResponseData returns an override response if present; otherwise, a default message.
 func getResponseData(path string, config *Config) interface{} {
-	if override, ok := config.Responses[path]; ok {
-		return override
+	// Normalize path by trimming trailing slashes
+	normalizedPath := strings.TrimRight(path, "/")
+
+	if override, ok := config.Responses[normalizedPath]; ok {
+		switch v := override.(type) {
+		case string:
+			// If it's a string, try to decode it as JSON into a map
+			var result map[string]interface{}
+			if err := json.Unmarshal([]byte(v), &result); err != nil {
+				log.Printf("Failed to parse JSON string: %v", err)
+				return map[string]string{"error": "Invalid JSON override"}
+			}
+			return result
+
+		default:
+			// For YAML structures, convert them properly
+			converted := convertToJSONCompatible(override)
+			return converted
+		}
 	}
-	return map[string]string{"message": fmt.Sprintf("Default response for %s", path)}
+
+	return map[string]string{"message": fmt.Sprintf("Response for %s", normalizedPath)}
+}
+
+// Simplified map conversion
+func convertToJSONCompatible(i interface{}) interface{} {
+	switch x := i.(type) {
+	case map[interface{}]interface{}:
+		m2 := map[string]interface{}{}
+		for k, v := range x {
+			m2[fmt.Sprintf("%v", k)] = convertToJSONCompatible(v)
+		}
+		return m2
+	case []interface{}:
+		for i, v := range x {
+			x[i] = convertToJSONCompatible(v)
+		}
+		return x
+	default:
+		return x
+	}
+}
+
+func normalResponse(w http.ResponseWriter, responseData interface{}) {
+	w.Header().Set("Content-Type", "application/json")
+	if err := json.NewEncoder(w).Encode(responseData); err != nil {
+		log.Printf("Error encoding response: %v", err)
+		sendJSONError(w, http.StatusInternalServerError, "Internal server error")
+		return
+	}
 }
 
 func isStreaming(r *http.Request) bool {
@@ -100,11 +162,6 @@ func streamResponse(w http.ResponseWriter, responseData interface{}, config *Con
 	if f, ok := w.(http.Flusher); ok {
 		f.Flush()
 	}
-}
-
-func normalResponse(w http.ResponseWriter, responseData interface{}) {
-	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(responseData)
 }
 
 // marshalJSON converts v to a JSON string (or returns "{}" on error).
