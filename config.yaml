@@ -1,0 +1,20 @@
+# URL or file path to your API spec YAML.
+api_spec: "https://raw.githubusercontent.com/openai/openai-openapi/master/openapi.yaml"
+
+latency:
+  low: 50           # Low latency in ms.
+  high: 5000        # High latency in ms.
+  low_frequency: 0.8  # 80% chance to use low latency.
+
+prefix: "v1"
+
+responses:
+  /v1/assistant:
+    custom: "This is an override response"
+
+error_response:
+  code: 500
+  body:
+    error: "simulated error occurred"
+
+error_frequency: 0.1
