@@ -37,7 +37,7 @@ func TestLoadConfigValid(t *testing.T) {
 		t.Errorf("Expected api_spec to be spec.yaml, got: %s", config.APISpec)
 	}
 	if config.Latency.Low != 100 {
-		t.Errorf("Expected latency.low to be 100, got: %d", config.Latency.Low)
+		t.Errorf("Expected latency.low to be 100, got: %f", config.Latency.Low)
 	}
 	if !strings.Contains(config.Prefix, "v1") {
 		t.Errorf("Expected prefix to contain v1, got: %s", config.Prefix)
