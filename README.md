@@ -4,7 +4,7 @@ Mock an arbitrary API using an OpenAPI spec, simulating low and high latency, as
 ## Features
 
 * Mock a full api spec, such as OpenAI.
-* Set a frequency for low and high latency responses.
+* Set a range for the latency of the response.
 * Set a frequency for error rates.
 * Custom JSON response overrides.
 
@@ -17,7 +17,6 @@ api_spec: "https://raw.githubusercontent.com/openai/openai-openapi/master/openap
 latency:
   low: 50           # Low latency in ms.
   high: 5000        # High latency in ms.
-  low_frequency: 0.8  # 80% chance to use low latency.
 
 prefix: "v1"
 
@@ -61,8 +60,7 @@ error_response:
 
 ### Latency
 
-Configures how quickly to respond with the mock data, in miliseconds. Specify a low frequency response, and how often to select it vs a higher latency response.
-
+Configures how quickly to respond with the mock data, in miliseconds. Specify the range for the latency of the response (randomly selected).
 
 ### Responses
 

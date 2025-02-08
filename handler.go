@@ -19,7 +19,7 @@ type ErrorResponse struct {
 // response. It also streams if the query parameter stream=true is present.
 func handleRequest(w http.ResponseWriter, r *http.Request, path string, config *Config) {
 	// Simulate latency.
-	chosenLatency := chooseLatency(config)
+	chosenLatency := getLatency(config)
 	log.Printf("Path %s: Sleeping for %d ms", path, chosenLatency)
 	time.Sleep(time.Duration(chosenLatency) * time.Millisecond)
 
@@ -37,12 +37,9 @@ func handleRequest(w http.ResponseWriter, r *http.Request, path string, config *
 	}
 }
 
-// chooseLatency selects low or high latency based on the configured frequency.
-func chooseLatency(config *Config) int {
-	if rand.Float64() < config.Latency.LowFrequency {
-		return config.Latency.Low
-	}
-	return config.Latency.High
+// getLatency selects low or high latency based on the configured frequency.
+func getLatency(config *Config) float64 {
+	return config.Latency.Low + rand.Float64()*(config.Latency.High-config.Latency.Low)
 }
 
 func sendJSONError(w http.ResponseWriter, code int, message string) {
@@ -154,7 +151,7 @@ func streamResponse(w http.ResponseWriter, responseData interface{}, config *Con
 			f.Flush()
 		}
 		// Sleep between chunks.
-		chosenLatency := chooseLatency(config)
+		chosenLatency := getLatency(config)
 		time.Sleep(time.Duration(chosenLatency) * time.Millisecond)
 	}
 	// Termination marker.

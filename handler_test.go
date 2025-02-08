@@ -13,9 +13,8 @@ func createTestConfig() *Config {
 	return &Config{
 		APISpec: "spec.yaml",
 		Latency: LatencyConfig{
-			Low:          10,
-			High:         20,
-			LowFrequency: 1.0, // always low latency for testing
+			Low:  10,
+			High: 20,
 		},
 		Responses: map[string]interface{}{
 			"/v1/test": map[string]string{"message": "override"},

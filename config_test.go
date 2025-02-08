@@ -11,7 +11,6 @@ api_spec: "spec.yaml"
 latency:
   low: 100
   high: 1000
-  low_frequency: 0.9
 responses:
   /v1/test:
     response: "{\"message\":\"override\"}"

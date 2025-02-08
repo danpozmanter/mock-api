@@ -25,9 +25,8 @@ type Config struct {
 // LatencyConfig specifies two latency values (in milliseconds)
 // and the frequency of using the low latency.
 type LatencyConfig struct {
-	Low          int     `yaml:"low"`
-	High         int     `yaml:"high"`
-	LowFrequency float64 `yaml:"low_frequency"`
+	Low  float64 `yaml:"low"`
+	High float64 `yaml:"high"`
 }
 
 // ErrorResponseConfig now includes Frequency.
@@ -72,9 +71,6 @@ func checkMissingConfig(config *Config) []string {
 	}
 	if config.Latency.High == 0 {
 		missing = append(missing, "latency.high")
-	}
-	if config.Latency.LowFrequency == 0 {
-		missing = append(missing, "latency.low_frequency")
 	}
 	if config.ErrorResponse.Frequency == 0 {
 		missing = append(missing, "error_response.frequency")
