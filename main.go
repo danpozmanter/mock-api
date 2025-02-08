@@ -62,9 +62,12 @@ func main() {
 		router.HandleFunc(ep, func(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusMethodNotAllowed)
-			json.NewEncoder(w).Encode(ErrorResponse{
+			if err := json.NewEncoder(w).Encode(ErrorResponse{
 				Error: "Method not allowed",
-			})
+			}); err != nil {
+				log.Printf("Error encoding method not allowed response: %v", err)
+			}
+
 		})
 	}
 
@@ -72,9 +75,12 @@ func main() {
 	router.NotFoundHandler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusNotFound)
-		json.NewEncoder(w).Encode(ErrorResponse{
+		if err := json.NewEncoder(w).Encode(ErrorResponse{
 			Error: "Not found",
-		})
+		}); err != nil {
+			log.Printf("Error encoding not found response: %v", err)
+		}
+
 	})
 
 	log.Printf("Loaded responses: %+v", config.Responses)

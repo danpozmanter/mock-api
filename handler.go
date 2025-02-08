@@ -48,7 +48,10 @@ func sendJSONError(w http.ResponseWriter, code int, message string) {
 	if err := json.NewEncoder(w).Encode(ErrorResponse{Error: message}); err != nil {
 		log.Printf("Error encoding error response: %v", err)
 		// If JSON encoding fails, send a minimal JSON error
-		w.Write([]byte(`{"error":"Internal server error"}`))
+		if _, err := w.Write([]byte(`{"error":"Internal server error"}`)); err != nil {
+			log.Printf("Error writing response: %v", err)
+		}
+
 	}
 }
 
@@ -138,7 +141,6 @@ func streamResponse(w http.ResponseWriter, responseData interface{}, config *Con
 	chunkSize := len(jsonBytes) / chunkCount
 	if chunkSize == 0 {
 		chunkSize = len(jsonBytes)
-		chunkCount = 1
 	}
 	for i := 0; i < len(jsonBytes); i += chunkSize {
 		end := i + chunkSize
