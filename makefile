@@ -13,7 +13,15 @@ run: build
 	./$(BINARY)
 
 test:
-	go test ./...
+	go test ./... -cover
+
+testreport:
+	go test ./... -coverprofile=coverage.out
+	go tool cover -func=coverage.out
+	rm -fv coverage.out
 
 clean:
 	rm -f $(BINARY)
+
+lint:
+	golangci-lint run

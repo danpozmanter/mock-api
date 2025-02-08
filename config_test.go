@@ -100,3 +100,54 @@ prefix: ""
 		}
 	}
 }
+
+func TestLoadConfigFileNotFound(t *testing.T) {
+	_, err := loadConfig("non_existent_config.yaml")
+	if err == nil || !strings.Contains(err.Error(), "error reading config file") {
+		t.Fatalf("Expected file not found error, got: %v", err)
+	}
+}
+
+func TestLoadConfigInvalidYAML(t *testing.T) {
+	filename := "invalid_config.yaml"
+	invalidYAML := `invalid: yaml: -`
+
+	if err := os.WriteFile(filename, []byte(invalidYAML), 0644); err != nil {
+		t.Fatalf("Failed to write invalid test config: %v", err)
+	}
+	defer os.Remove(filename)
+
+	_, err := loadConfig(filename)
+	if err == nil || !strings.Contains(err.Error(), "error parsing config file") {
+		t.Fatalf("Expected YAML parsing error, got: %v", err)
+	}
+}
+
+func TestLoadConfigPartialMissingValues(t *testing.T) {
+	partialConfig := `
+api_spec: "spec.yaml"
+latency:
+  low: 0
+  high: 0
+error_response:
+  code: 500
+  body: null
+prefix: ""
+`
+	filename := "test_partial_config.yaml"
+	if err := os.WriteFile(filename, []byte(partialConfig), 0644); err != nil {
+		t.Fatalf("Failed to write test config: %v", err)
+	}
+	defer os.Remove(filename)
+
+	_, err := loadConfig(filename)
+	if err == nil {
+		t.Fatal("Expected error for missing config values, got nil")
+	}
+	expectedFields := []string{"latency.low", "latency.high", "error_response.body", "prefix"}
+	for _, field := range expectedFields {
+		if !strings.Contains(err.Error(), field) {
+			t.Errorf("Expected error message to contain %s", field)
+		}
+	}
+}

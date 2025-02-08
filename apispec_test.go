@@ -44,3 +44,32 @@ func TestLoadAPISpecInvalid(t *testing.T) {
 		t.Errorf("Expected error message to mention parsing, got: %s", err.Error())
 	}
 }
+
+func TestLoadAPISpecFileNotFound(t *testing.T) {
+	_, err := loadAPISpec("non_existent_file.yaml")
+	if err == nil || !strings.Contains(err.Error(), "error reading API spec file") {
+		t.Fatalf("Expected file not found error, got: %v", err)
+	}
+}
+
+func TestLoadAPISpecInvalidYAML(t *testing.T) {
+	filename := "invalid_spec.yaml"
+	invalidYAML := `invalid: yaml: -`
+
+	if err := os.WriteFile(filename, []byte(invalidYAML), 0644); err != nil {
+		t.Fatalf("Failed to write invalid test API spec: %v", err)
+	}
+	defer os.Remove(filename)
+
+	_, err := loadAPISpec(filename)
+	if err == nil || !strings.Contains(err.Error(), "error parsing API spec") {
+		t.Fatalf("Expected YAML parsing error, got: %v", err)
+	}
+}
+
+func TestLoadAPISpecHTTPFailure(t *testing.T) {
+	_, err := loadAPISpec("http://nonexistent-url.com/spec.yaml")
+	if err == nil || !strings.Contains(err.Error(), "error fetching API spec from URL") {
+		t.Fatalf("Expected HTTP fetch error, got: %v", err)
+	}
+}
