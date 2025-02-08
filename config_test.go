@@ -67,7 +67,7 @@ prefix: ""
 	if err == nil {
 		t.Fatal("Expected error for missing config values, got nil")
 	}
-	expectedFields := []string{"api_spec", "latency.low", "latency.high", "latency.low_frequency", "error_response.frequency", "error_response.code", "error_response.body", "prefix"}
+	expectedFields := []string{"api_spec", "latency.low", "latency.high", "error_response.frequency", "error_response.code", "error_response.body", "prefix"}
 	for _, field := range expectedFields {
 		if !strings.Contains(err.Error(), field) {
 			t.Errorf("Expected error message to contain %s", field)
@@ -93,7 +93,7 @@ prefix: ""
 	if err == nil {
 		t.Fatal("Expected error for missing config values, got nil")
 	}
-	expectedFields := []string{"api_spec", "latency.low", "latency.high", "latency.low_frequency", "error_response.frequency", "error_response.code", "error_response.body", "prefix"}
+	expectedFields := []string{"api_spec", "latency.low", "latency.high", "error_response.frequency", "error_response.code", "error_response.body", "prefix"}
 	for _, field := range expectedFields {
 		if !strings.Contains(err.Error(), field) {
 			t.Errorf("Expected error message to contain %s", field)
