@@ -20,7 +20,7 @@ type ErrorResponse struct {
 func handleRequest(w http.ResponseWriter, r *http.Request, path string, config *Config) {
 	// Simulate latency.
 	chosenLatency := getLatency(config)
-	log.Printf("Path %s: Sleeping for %d ms", path, chosenLatency)
+	log.Printf("Path %s: Sleeping for %f ms", path, chosenLatency)
 	time.Sleep(time.Duration(chosenLatency) * time.Millisecond)
 
 	// Possibly simulate an error.
