@@ -1,7 +1,7 @@
 # mock-api
 Mock an arbitrary API using an OpenAPI spec, simulating low and high latency, as well as desired level of stability.
 
-![Tests Passing](https://img.shields.io/github/workflow/status/danpozmanter/mock-api/Run%20Tests%20and%20Code%20Coverage?label=tests%3A%20passing&logo=github)
+![Tests Passing](https://github.com/danpozmanter/mock-api/actions/workflows/test.yml/badge.svg)
 
 ## Features
 
