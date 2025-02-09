@@ -174,8 +174,8 @@ func TestSimulateErrorStreaming(t *testing.T) {
 	simulateError(w, req, config)
 
 	res := w.Result()
-	if res.StatusCode != http.StatusOK {
-		t.Errorf("Expected status 200 for streaming, got %d", res.StatusCode)
+	if res.StatusCode != http.StatusInternalServerError {
+		t.Errorf("Expected status 500 for error while streaming, got %d", res.StatusCode)
 	}
 
 	body := w.Body.String()

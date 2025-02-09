@@ -58,16 +58,23 @@ func sendJSONError(w http.ResponseWriter, code int, message string) {
 // simulateError writes an error response, streaming if requested.
 func simulateError(w http.ResponseWriter, r *http.Request, config *Config) {
 	log.Printf("Simulating error for request")
-	if isStreaming(r) {
-		w.Header().Set("Content-Type", "text/event-stream")
-		fmt.Fprintf(w, "data: %s\n\n", marshalJSON(config.ErrorResponse.Body))
-		if f, ok := w.(http.Flusher); ok {
-			f.Flush()
-		}
-	} else {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(config.ErrorResponse.Code)
-		_ = json.NewEncoder(w).Encode(config.ErrorResponse.Body)
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(config.ErrorResponse.Code)
+
+	// Convert the error body to a JSON-compatible format
+	errorBody := convertToJSONCompatible(config.ErrorResponse.Body)
+
+	jsonBytes, err := json.Marshal(errorBody)
+	if err != nil {
+		log.Printf("Error encoding error response: %v", err)
+		w.Write([]byte(`{"error":"Internal server error"}`))
+		return
+	}
+
+	_, writeErr := w.Write(jsonBytes)
+	if writeErr != nil {
+		log.Printf("Error writing error response: %v", writeErr)
 	}
 }
 
