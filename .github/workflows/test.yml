@@ -1,4 +1,4 @@
-name: Run Tests and Code Coverage
+name: Tests
 
 on: [push, pull_request]
 
