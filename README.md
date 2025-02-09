@@ -1,7 +1,7 @@
 # mock-api
 Mock an arbitrary API using an OpenAPI spec, simulating low and high latency, as well as desired level of stability.
 
-![Tests Passing](https://github.com/danpozmanter/mock-api/actions/workflows/test.yml/badge.svg)
+[![Tests Passing](https://github.com/danpozmanter/mock-api/actions/workflows/test.yml/badge.svg)](https://github.com/danpozmanter/mock-api/actions)
 
 ## Features
 
