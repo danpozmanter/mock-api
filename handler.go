@@ -17,14 +17,14 @@ type ErrorResponse struct {
 
 // handleRequest simulates latency, random failures, and returns the (possibly overridden)
 // response. It also streams if the query parameter stream=true is present.
-func handleRequest(w http.ResponseWriter, r *http.Request, path string, config *Config) {
+func handleRequest(w http.ResponseWriter, r *http.Request, path string, config *Config, simulator *ErrorSimulator) {
 	// Simulate latency.
 	chosenLatency := getLatency(config)
 	log.Printf("Path %s: Sleeping for %f ms", path, chosenLatency)
 	time.Sleep(time.Duration(chosenLatency) * time.Millisecond)
 
 	// Possibly simulate an error.
-	if rand.Float64() < config.ErrorResponse.Frequency {
+	if simulator.ShouldError() {
 		simulateError(w, r, config)
 		return
 	}

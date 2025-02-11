@@ -1,7 +1,7 @@
+// Package main implements an HTTP server that handles API requests based on a configuration file
 package main
 
 import (
-	"encoding/json"
 	"flag"
 	"log"
 	"net/http"
@@ -10,82 +10,100 @@ import (
 	"github.com/gorilla/mux"
 )
 
-func main() {
-	// Command-line flags.
-	configFile := flag.String("config", "config.yaml", "Path to config file")
-	port := flag.String("port", "8080", "Port to listen on")
+// setupFlags initializes and parses command-line flags for server configuration.
+// It returns the paths to the config file and the port number to listen on.
+func setupFlags() (configFile string, port string) {
+	configFilePtr := flag.String("config", "config.yaml", "Path to config file")
+	portPtr := flag.String("port", "8080", "Port to listen on")
 	flag.Parse()
+	return *configFilePtr, *portPtr
+}
 
-	// Load configuration.
-	config, err := loadConfig(*configFile)
+// initializeServer loads and validates the server configuration and API specification.
+// It returns the parsed config and API spec along with any error encountered.
+func initializeServer(configFile string) (*Config, *APISpec, error) {
+	config, err := loadConfig(configFile)
 	if err != nil {
-		log.Fatalf("Failed to load config: %v", err)
+		return nil, nil, err
 	}
 	log.Printf("Loaded config: %+v", config)
 
-	// Load the API spec.
 	spec, err := loadAPISpec(config.APISpec)
 	if err != nil {
-		log.Fatalf("Failed to load API spec: %v", err)
+		return nil, nil, err
 	}
 	log.Printf("Loaded API spec with %d paths", len(spec.Paths))
+	return config, spec, nil
+}
 
-	// Create router.
+// buildFullPath constructs the complete URL path by combining the prefix and path.
+// It ensures proper formatting by trimming extra slashes.
+func buildFullPath(prefix, path string) string {
+	trimmedPrefix := strings.Trim(prefix, "/")
+	trimmedPath := strings.TrimLeft(path, "/")
+	return "/" + trimmedPrefix + "/" + trimmedPath
+}
+
+// registerMethodHandlers sets up route handlers for all HTTP methods defined in the API spec.
+// It returns a map of valid HTTP methods for the given path.
+func registerMethodHandlers(router *mux.Router, fullPath string, methods map[string]interface{}, config *Config) map[string]bool {
+	validMethods := make(map[string]bool)
+	simulator := NewErrorSimulator(config.ErrorResponse.Frequency)
+	for method := range methods {
+		httpMethod := strings.ToUpper(method)
+		validMethods[httpMethod] = true
+		router.HandleFunc(fullPath, func(w http.ResponseWriter, r *http.Request) {
+			handleRequest(w, r, fullPath, config, simulator)
+		}).Methods(httpMethod)
+		log.Printf("Registered endpoint: %s %s", httpMethod, fullPath)
+	}
+	return validMethods
+}
+
+// registerMethodNotAllowedHandler sets up a handler for requests using unsupported HTTP methods.
+func registerMethodNotAllowedHandler(router *mux.Router, fullPath string) {
+	router.HandleFunc(fullPath, func(w http.ResponseWriter, r *http.Request) {
+		sendJSONError(w, http.StatusMethodNotAllowed, "Method not allowed")
+	})
+}
+
+// registerNotFoundHandler sets up a handler for requests to undefined paths.
+func registerNotFoundHandler(router *mux.Router) {
+	router.NotFoundHandler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		sendJSONError(w, http.StatusNotFound, "Not found")
+	})
+}
+
+// setupRouter configures the HTTP router with all endpoints from the API spec.
+// It returns the configured router ready for use.
+func setupRouter(config *Config, spec *APISpec) *mux.Router {
 	router := mux.NewRouter().StrictSlash(true)
-
-	// Store valid methods for each path
 	pathMethods := make(map[string]map[string]bool)
 
-	// Register each endpoint from the spec with the provided prefix.
 	for path, methods := range spec.Paths {
-		trimmedPrefix := strings.Trim(config.Prefix, "/")
-		trimmedPath := strings.TrimLeft(path, "/")
-		fullPath := "/" + trimmedPrefix + "/" + trimmedPath
-
-		// Store valid methods for this path
-		pathMethods[fullPath] = make(map[string]bool)
-
-		for method := range methods {
-			httpMethod := strings.ToUpper(method)
-			pathMethods[fullPath][httpMethod] = true
-
-			// Capture fullPath in closure.
-			ep := fullPath
-			router.HandleFunc(ep, func(w http.ResponseWriter, r *http.Request) {
-				handleRequest(w, r, ep, config)
-			}).Methods(httpMethod)
-			log.Printf("Registered endpoint: %s %s", httpMethod, fullPath)
-		}
-
-		// Add a handler for unsupported methods on valid paths
-		ep := fullPath
-		router.HandleFunc(ep, func(w http.ResponseWriter, r *http.Request) {
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusMethodNotAllowed)
-			if err := json.NewEncoder(w).Encode(ErrorResponse{
-				Error: "Method not allowed",
-			}); err != nil {
-				log.Printf("Error encoding method not allowed response: %v", err)
-			}
-
-		})
+		fullPath := buildFullPath(config.Prefix, path)
+		pathMethods[fullPath] = registerMethodHandlers(router, fullPath, methods, config)
+		registerMethodNotAllowedHandler(router, fullPath)
 	}
 
-	// Catch-all handler for unknown paths
-	router.NotFoundHandler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusNotFound)
-		if err := json.NewEncoder(w).Encode(ErrorResponse{
-			Error: "Not found",
-		}); err != nil {
-			log.Printf("Error encoding not found response: %v", err)
-		}
+	registerNotFoundHandler(router)
+	return router
+}
 
-	})
+// main initializes and starts the HTTP server with the configured router.
+// It handles command-line flags, loads configuration, and sets up all routes.
+func main() {
+	configFile, port := setupFlags()
 
+	config, spec, err := initializeServer(configFile)
+	if err != nil {
+		log.Fatalf("Failed to initialize server: %v", err)
+	}
+
+	router := setupRouter(config, spec)
 	log.Printf("Loaded responses: %+v", config.Responses)
 
-	addr := ":" + *port
+	addr := ":" + port
 	log.Printf("Starting server on %s", addr)
 	if err := http.ListenAndServe(addr, router); err != nil {
 		log.Fatalf("Server failed: %v", err)

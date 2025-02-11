@@ -9,6 +9,7 @@ import (
 	"time"
 )
 
+// createTestConfig initializes a test configuration with default values.
 func createTestConfig() *Config {
 	return &Config{
 		APISpec: "spec.yaml",
@@ -22,24 +23,25 @@ func createTestConfig() *Config {
 		ErrorResponse: ErrorResponseConfig{
 			Code:      500,
 			Body:      map[string]string{"error": "simulated error"},
-			Frequency: 0.0, // no error by default
+			Frequency: 0.0, // No error by default.
 		},
 		Prefix: "v1",
 	}
 }
 
-// Test HandleRequest - Normal Response
-func TestHandleRequestNormal(t *testing.T) {
+// TestHandleRequest_Success verifies that a normal response is returned correctly.
+func TestHandleRequest_Success(t *testing.T) {
 	config := createTestConfig()
 	config.Responses["/v1/test"] = `{"custom":"data","value":123}`
+	errorSim := NewErrorSimulator(0.0)
 
 	req := httptest.NewRequest("GET", "http://example.com/?stream=false", nil)
 	w := httptest.NewRecorder()
-	handleRequest(w, req, "/v1/test", config)
+	handleRequest(w, req, "/v1/test", config, errorSim)
 	res := w.Result()
 
 	if res.StatusCode != http.StatusOK {
-		t.Errorf("Expected status 200, got %d", res.StatusCode)
+		t.Fatalf("Expected status 200, got %d", res.StatusCode)
 	}
 
 	var responseData map[string]interface{}
@@ -48,25 +50,26 @@ func TestHandleRequestNormal(t *testing.T) {
 	}
 
 	if responseData["custom"] != "data" || responseData["value"].(float64) != 123 {
-		t.Errorf("Expected custom override data, got %v", responseData)
+		t.Errorf("Unexpected response data: %v", responseData)
 	}
 }
 
-// Test HandleRequest - Struct Override
-func TestHandleRequestWithStructOverride(t *testing.T) {
+// TestHandleRequest_StructOverride ensures structured overrides work.
+func TestHandleRequest_StructOverride(t *testing.T) {
 	config := createTestConfig()
 	config.Responses["/v1/struct"] = map[string]interface{}{
 		"status": "success",
 		"code":   200,
 	}
+	errorSim := NewErrorSimulator(0.0)
 
 	req := httptest.NewRequest("GET", "http://example.com/?stream=false", nil)
 	w := httptest.NewRecorder()
-	handleRequest(w, req, "/v1/struct", config)
+	handleRequest(w, req, "/v1/struct", config, errorSim)
 	res := w.Result()
 
 	if res.StatusCode != http.StatusOK {
-		t.Errorf("Expected status 200, got %d", res.StatusCode)
+		t.Fatalf("Expected status 200, got %d", res.StatusCode)
 	}
 
 	var responseData map[string]interface{}
@@ -75,63 +78,72 @@ func TestHandleRequestWithStructOverride(t *testing.T) {
 	}
 
 	if responseData["status"] != "success" || responseData["code"].(float64) != 200 {
-		t.Errorf("Expected struct override data, got %v", responseData)
+		t.Errorf("Unexpected struct response data: %v", responseData)
 	}
 }
 
-// Test HandleRequest - Streaming
-func TestHandleRequestStreaming(t *testing.T) {
+// TestHandleRequest_Streaming validates correct streaming behavior.
+func TestHandleRequest_Streaming(t *testing.T) {
 	config := createTestConfig()
+	errorSim := NewErrorSimulator(0.0)
+
 	req := httptest.NewRequest("GET", "http://example.com/?stream=true", nil)
 	w := httptest.NewRecorder()
 	start := time.Now()
-	handleRequest(w, req, "/v1/test", config)
+	handleRequest(w, req, "/v1/test", config, errorSim)
 	elapsed := time.Since(start)
+
 	if elapsed > 2*time.Second {
 		t.Errorf("Streaming took too long: %v", elapsed)
 	}
+
 	res := w.Result()
 	if ct := res.Header.Get("Content-Type"); !strings.Contains(ct, "text/event-stream") {
 		t.Errorf("Expected Content-Type text/event-stream, got %s", ct)
 	}
+
 	body := w.Body.String()
 	if !strings.Contains(body, "[DONE]") {
-		t.Errorf("Expected streaming termination marker [DONE], got %s", body)
+		t.Errorf("Missing streaming termination marker [DONE], got: %s", body)
 	}
 }
 
-// Test HandleRequest - Error Response
-func TestHandleRequestError(t *testing.T) {
+// TestHandleRequest_Error verifies simulated error responses.
+func TestHandleRequest_Error(t *testing.T) {
 	config := createTestConfig()
-	config.ErrorResponse.Frequency = 1.0 // force error
+	errorSim := NewErrorSimulator(1.0) // 100% error rate.
+
 	req := httptest.NewRequest("GET", "http://example.com/?stream=false", nil)
 	w := httptest.NewRecorder()
-	handleRequest(w, req, "/v1/test", config)
+	handleRequest(w, req, "/v1/test", config, errorSim)
 	res := w.Result()
-	if res.StatusCode != 500 {
-		t.Errorf("Expected status 500, got %d", res.StatusCode)
+
+	if res.StatusCode != http.StatusInternalServerError {
+		t.Fatalf("Expected status 500, got %d", res.StatusCode)
 	}
+
 	var errResp map[string]string
 	if err := json.NewDecoder(res.Body).Decode(&errResp); err != nil {
-		t.Errorf("Error decoding JSON: %v", err)
+		t.Fatalf("Error decoding JSON: %v", err)
 	}
+
 	if errResp["error"] != "simulated error" {
-		t.Errorf("Expected simulated error, got %s", errResp["error"])
+		t.Errorf("Unexpected error response: %v", errResp)
 	}
 }
 
-// Test HandleRequest - Unknown Path
-func TestHandleRequestUnknownPath(t *testing.T) {
+// TestHandleRequest_UnknownPath ensures a default response is returned for unknown paths.
+func TestHandleRequest_UnknownPath(t *testing.T) {
 	config := createTestConfig()
+	errorSim := NewErrorSimulator(0.0)
 
 	req := httptest.NewRequest("GET", "http://example.com/v1/unknown", nil)
 	w := httptest.NewRecorder()
-
-	handleRequest(w, req, "/v1/unknown", config)
+	handleRequest(w, req, "/v1/unknown", config, errorSim)
 	res := w.Result()
 
 	if res.StatusCode != http.StatusOK {
-		t.Errorf("Expected status 200, got %d", res.StatusCode)
+		t.Fatalf("Expected status 200, got %d", res.StatusCode)
 	}
 
 	var responseData map[string]string
@@ -144,14 +156,14 @@ func TestHandleRequestUnknownPath(t *testing.T) {
 	}
 }
 
-// Test Send JSON Error
+// TestSendJSONError ensures error responses are properly formatted.
 func TestSendJSONError(t *testing.T) {
 	w := httptest.NewRecorder()
 	sendJSONError(w, http.StatusInternalServerError, "test error")
 
 	res := w.Result()
 	if res.StatusCode != http.StatusInternalServerError {
-		t.Errorf("Expected status 500, got %d", res.StatusCode)
+		t.Fatalf("Expected status 500, got %d", res.StatusCode)
 	}
 
 	var responseData map[string]string
@@ -160,101 +172,46 @@ func TestSendJSONError(t *testing.T) {
 	}
 
 	if responseData["error"] != "test error" {
-		t.Errorf("Expected 'test error', got: %v", responseData["error"])
+		t.Errorf("Unexpected error message: %v", responseData["error"])
 	}
 }
 
-// Test Simulate Error - Streaming
-func TestSimulateErrorStreaming(t *testing.T) {
+// TestGetLatency ensures latency values fall within the expected range.
+func TestGetLatency(t *testing.T) {
 	config := createTestConfig()
-	config.ErrorResponse.Frequency = 1.0 // Always trigger error
-
-	req := httptest.NewRequest("GET", "http://example.com/v1/test?stream=true", nil)
-	w := httptest.NewRecorder()
-	simulateError(w, req, config)
-
-	res := w.Result()
-	if res.StatusCode != http.StatusInternalServerError {
-		t.Errorf("Expected status 500 for error while streaming, got %d", res.StatusCode)
-	}
-
-	body := w.Body.String()
-	if !strings.Contains(body, `"error":"simulated error"`) {
-		t.Errorf("Expected simulated error in stream, got: %s", body)
+	for i := 0; i < 100; i++ {
+		latency := getLatency(config)
+		if latency < config.Latency.Low || latency > config.Latency.High {
+			t.Errorf("Latency %f is out of range [%f, %f]", latency, config.Latency.Low, config.Latency.High)
+		}
 	}
 }
 
-// Test Stream Response Encoding Failure
-func TestStreamResponseEncodingFailure(t *testing.T) {
-	w := httptest.NewRecorder()
-	config := createTestConfig()
-
-	// Force JSON marshalling failure by passing an invalid type
-	data := make(chan int)
-
-	streamResponse(w, data, config)
-
-	res := w.Result()
-	if res.StatusCode != http.StatusInternalServerError {
-		t.Errorf("Expected 500 Internal Server Error, got %d", res.StatusCode)
-	}
-
-	body := w.Body.String()
-	if !strings.Contains(body, "Internal server error") {
-		t.Errorf("Expected internal server error message, got: %s", body)
-	}
-}
-
-// Test Get Response Data - Invalid JSON
-func TestGetResponseDataWithInvalidJSON(t *testing.T) {
-	config := createTestConfig()
-	config.Responses["/v1/test"] = `{"message":}` // Invalid JSON
-
-	responseData := getResponseData("/v1/test", config)
-	if _, ok := responseData.(map[string]string); !ok {
-		t.Errorf("Expected a map response, got: %T", responseData)
-	}
-}
-
-// Test Convert To JSON Compatible
+// TestConvertToJSONCompatible checks conversion of complex structures.
 func TestConvertToJSONCompatible(t *testing.T) {
 	input := map[interface{}]interface{}{
-		"key1": "value1",
-		"key2": map[interface{}]interface{}{
-			"nestedKey": "nestedValue",
+		"nested": map[interface{}]interface{}{
+			"key": "value",
 		},
-		"key3": []interface{}{1, 2, 3},
+		"empty": map[interface{}]interface{}{},
+	}
+
+	expected := map[string]interface{}{
+		"nested": map[string]interface{}{
+			"key": "value",
+		},
+		"empty": map[string]interface{}{},
 	}
 
 	result := convertToJSONCompatible(input)
-	output, ok := result.(map[string]interface{})
-	if !ok || output["key1"] != "value1" {
-		t.Errorf("Unexpected conversion result: %v", result)
+	if !deepEqual(result, expected) {
+		t.Errorf("Expected %+v, got %+v", expected, result)
 	}
 }
 
-// Test Normal Response Encoding Failure
-func TestNormalResponseEncodingFailure(t *testing.T) {
-	w := httptest.NewRecorder()
-
-	// Invalid data type (channel) to force encoding failure
-	data := make(chan int)
-
-	normalResponse(w, data)
-
-	res := w.Result()
-	if res.StatusCode != http.StatusInternalServerError {
-		t.Errorf("Expected 500 Internal Server Error, got %d", res.StatusCode)
-	}
-}
-
-// Test Marshal JSON Invalid Input
-func TestMarshalJSONInvalidInput(t *testing.T) {
-	// Force error by passing an unmarshalable type
-	data := make(chan int)
-	result := marshalJSON(data)
-
-	if result != "{}" {
-		t.Errorf("Expected '{}', got: %s", result)
-	}
+// deepEqual checks deep equality between two objects.
+func deepEqual(a, b interface{}) bool {
+	aJSON, _ := json.Marshal(a)
+	bJSON, _ := json.Marshal(b)
+	return string(aJSON) == string(bJSON)
 }

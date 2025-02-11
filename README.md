@@ -1,5 +1,6 @@
 # mock-api
-Mock an arbitrary API using an OpenAPI spec, simulating low and high latency, as well as desired level of stability.
+
+Mock an API using an OpenAPI spec, simulating low and high latency, as well as a mocked error response.
 
 [![Tests Passing](https://github.com/danpozmanter/mock-api/actions/workflows/test.yml/badge.svg)](https://github.com/danpozmanter/mock-api/actions)
 
@@ -7,7 +8,7 @@ Mock an arbitrary API using an OpenAPI spec, simulating low and high latency, as
 
 * Mock a full api spec, such as OpenAI.
 * Set a range for the latency of the response.
-* Set a frequency for error rates.
+* Set a frequency for error responses.
 * Custom JSON response overrides.
 
 ## Example Configuration & Explanation
@@ -42,15 +43,22 @@ responses:
     }
   
   # Structure override (will be converted to JSON)
-  "/v1/models":
-    object: "list"
-    data:
-      - id: "gpt-3.5-turbo"
-        object: "model"
-        created: 1677610602
-      - id: "gpt-4"
-        object: "model"
-        created: 1677610602
+  "/v1/models": |
+    {
+      "object": "list",
+      "data": [
+        {
+          "id": "gpt-3.5-turbo",
+          "object": "model",
+          "created": 1677610602
+        },
+        {
+          "id": "gpt-4",
+          "object": "model",
+          "created": 1677610602
+        }
+      ]
+    }
 
 error_response:
   code: 500
