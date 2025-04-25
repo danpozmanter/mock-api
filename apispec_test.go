@@ -68,7 +68,7 @@ func TestLoadAPISpecInvalidYAML(t *testing.T) {
 }
 
 func TestLoadAPISpecHTTPFailure(t *testing.T) {
-	_, err := loadAPISpec("http://nonexistent-url.com/spec.yaml")
+	_, err := loadAPISpec("http://nonexistent-url-that-definitely-does-not-exist.com/spec.yaml")
 	if err == nil || !strings.Contains(err.Error(), "error fetching API spec from URL") {
 		t.Fatalf("Expected HTTP fetch error, got: %v", err)
 	}

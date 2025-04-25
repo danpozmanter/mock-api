@@ -15,6 +15,11 @@ responses:
       "object": "chat.completion",
       "created": 1677652288,
       "model": "gpt-3.5-turbo",
+      "usage": {
+        "prompt_tokens": 78,
+        "completion_tokens": 101,
+        "total_tokens": 179
+      },
       "choices": [
         {
           "index": 0,
