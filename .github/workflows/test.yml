@@ -9,15 +9,32 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Set up Go
-        uses: actions/setup-go@v5
-        with:
-          go-version: '1.21'
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
 
-      - name: Run Tests
-        run: go test ./... -coverprofile=coverage.out -covermode=atomic
-
-      - name: Upload Coverage Report
-        uses: codecov/codecov-action@v3
+      - name: Cache cargo registry and gossamer build
+        uses: actions/cache@v4
         with:
-          files: ./coverage.out
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            gossamer/target
+          key: ${{ runner.os }}-gossamer-${{ hashFiles('gossamer/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-gossamer-
+
+      - name: Build and install Gossamer (gos)
+        run: |
+          git clone --depth=1 https://github.com/danpozmanter/gossamer.git
+          cd gossamer
+          ./install.sh
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: gos check
+        run: gos check src/main.gos
+
+      - name: gos test
+        run: gos test src/
+
+      - name: gos lint
+        run: gos lint src/main.gos
