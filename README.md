@@ -1,11 +1,11 @@
-# mock-api (Gossamer port)
+# mock-api
 
 Mock an API using a JSON spec, simulating low and high latency along
-with a mocked error response. This is a [Gossamer][gossamer] port of
-the original Go implementation, which still lives untouched under
+with a mocked error response. Written in [Gossamer][gossamer]; the
+original Go implementation still lives untouched under
 [`go_implementation/`](./go_implementation/).
 
-[gossamer]: https://github.com/gossamer-lang/gossamer
+[gossamer]: https://github.com/danpozmanter/gossamer
 
 ## Features
 
@@ -19,22 +19,22 @@ the original Go implementation, which still lives untouched under
 ## Project layout
 
 ```
-project.toml             # Gossamer manifest
-config.json              # mock-api config (loaded by --config, defaults to ./config.json)
-spec.json                # API spec (referenced from config.json's "api_spec")
+project.toml          # project manifest
+config.json           # mock-api config (loaded by --config, defaults to ./config.json)
+spec.json             # API spec (referenced from config.json's "api_spec")
 src/
-├── main.gos             # entry point — flag parsing, App + http::Handler impl
-├── random/mod.gos       # LCG PRNG + tests
-├── simulator/mod.gos    # ErrorSimulator + tests (embeds its own PRNG)
-├── config/mod.gos       # config parse / required-field validation + tests
-├── apispec/mod.gos      # API spec loader + tests
-└── handler/mod.gos      # routing / latency / overrides / SSE shaping + tests
-go_implementation/        # the original Go port, kept for reference
+├── main.gos          # entry point — flag parsing, App + http::Handler impl
+├── random.gos        # LCG PRNG + tests
+├── simulator.gos     # ErrorSimulator + tests (embeds its own PRNG)
+├── config.gos        # config parse / required-field validation + tests
+├── apispec.gos       # API spec loader + tests
+└── handler.gos       # routing / latency / overrides / SSE shaping + tests
+go_implementation/     # the original Go port, kept for reference
 ```
 
-Each subdirectory module is independently testable via
-`gos test src/<name>/mod.gos`. `gos test src/` walks every `.gos`
-under `src/` and runs all tests in one shot.
+Each `src/<name>.gos` is its own module and is independently testable
+via `gos test src/<name>.gos`. `gos test src/` walks every file under
+`src/` and runs all tests in one shot.
 
 ## Configuration
 
@@ -116,12 +116,12 @@ gos run   src/main.gos        # boot the server (see runtime gotchas below)
 Each module's tests can also be run on their own:
 
 ```
-gos test src/random/mod.gos      #  6 PRNG tests
-gos test src/simulator/mod.gos   # 14 simulator tests
-gos test src/config/mod.gos      #  5 config tests
-gos test src/apispec/mod.gos     #  7 apispec tests
-gos test src/handler/mod.gos     # 21 handler tests
-gos test src/main.gos            #  1 build_app_config test
+gos test src/random.gos      #  6 PRNG tests
+gos test src/simulator.gos   # 14 simulator tests
+gos test src/config.gos      #  5 config tests
+gos test src/apispec.gos     #  7 apispec tests
+gos test src/handler.gos     # 21 handler tests
+gos test src/main.gos        #  1 build_app_config test
 ```
 
 The server listens on `0.0.0.0:8080` by default. Override with flags
@@ -208,13 +208,12 @@ called out in source comments next to the workaround, but in summary:
 1. **Cross-module function and method calls don't dispatch at runtime.**
    `gos check` resolves cross-module references just fine, but at
    runtime calls into another module return `()` (the call body is
-   never entered). The project is laid out as one module per
-   subdirectory anyway — every module is independently testable via
-   `gos test src/<name>/mod.gos` — and each module that needs a
-   helper from elsewhere keeps a private copy. `src/main.gos` wires
-   the modules together for the binary; the wiring typechecks but
-   the running server has the gaps until cross-module dispatch
-   lands.
+   never entered). The project is laid out as one module per file
+   anyway — every module is independently testable via
+   `gos test src/<name>.gos` — and each module that needs a helper
+   from elsewhere keeps a private copy. `src/main.gos` wires the
+   modules together for the binary; the wiring typechecks but the
+   running server has the gaps until cross-module dispatch lands.
 2. **Method names are dispatched name-globally.** Two `impl` blocks
    each defining `fn new(...)` with different arities collide and one
    poisons the dispatch table; we use distinct names (`Random::seeded`,
