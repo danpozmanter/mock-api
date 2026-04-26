@@ -1,0 +1,208 @@
+/// Config-file parsing and required-field validation. The
+/// config is kept as a parsed `json::Value` (not a typed
+/// struct) because the runtime can't yet iterate object keys
+/// or push into typed arrays — accessing fields directly via
+/// `v.foo.bar` works, so callers read what they need on demand.
+
+use std::encoding::json
+use std::fs
+
+/// Returns `name.to_string()` when `missing` is true, otherwise
+/// the empty string. Helper for `missing_config_fields`.
+pub fn pick(missing: bool, name: &str) -> String {
+    if missing { name.to_string() } else { "".to_string() }
+}
+
+/// Walks the parsed config root and reports which required
+/// fields are missing or zero. Fixed-size return so the caller
+/// can iterate without `[T]::push`, which is unwired today.
+pub fn missing_config_fields(root: &json::Value) -> [String; 7] {
+    let api_spec_missing: bool = !has_string(root, "api_spec")
+    let low_missing: bool = !has_positive_int(&root.latency, "low_ms")
+    let high_missing: bool = !has_positive_int(&root.latency, "high_ms")
+    let freq_missing: bool = !has_int(&root.error_response, "frequency_per_10k")
+    let code_missing: bool = !has_positive_int(&root.error_response, "code")
+    let body_missing: bool = !has_anything(&root.error_response, "body")
+    let prefix_missing: bool = !has_string(root, "prefix")
+
+    let s_api: String = pick(api_spec_missing, "api_spec")
+    let s_low: String = pick(low_missing, "latency.low_ms")
+    let s_high: String = pick(high_missing, "latency.high_ms")
+    let s_freq: String = pick(freq_missing, "error_response.frequency_per_10k")
+    let s_code: String = pick(code_missing, "error_response.code")
+    let s_body: String = pick(body_missing, "error_response.body")
+    let s_pref: String = pick(prefix_missing, "prefix")
+    let out: [String; 7] = [s_api, s_low, s_high, s_freq, s_code, s_body, s_pref]
+    out
+}
+
+/// Returns true when the rendered JSON has a non-empty string
+/// at `field`.
+pub fn has_string(obj: &json::Value, field: &str) -> bool {
+    let raw = json::render(obj)
+    let starts = format!("\"{field}\":\"")
+    let empty = format!("\"{field}\":\"\"")
+    raw.contains(starts.as_str()) && !raw.contains(empty.as_str())
+}
+
+/// Returns true when `obj.field` is an integer that is non-zero.
+pub fn has_positive_int(obj: &json::Value, field: &str) -> bool {
+    let raw = json::render(obj)
+    let needle = format!("\"{field}\":")
+    if !raw.contains(needle.as_str()) {
+        return false
+    }
+    let zero_mid = format!("\"{field}\":0,")
+    let zero_end = format!("\"{field}\":0}}")
+    !raw.contains(zero_mid.as_str()) && !raw.contains(zero_end.as_str())
+}
+
+/// Returns true when `obj.field` is an integer (zero allowed).
+pub fn has_int(obj: &json::Value, field: &str) -> bool {
+    has_positive_int(obj, field)
+}
+
+/// Returns true when `obj.field` is present and not `null`.
+pub fn has_anything(obj: &json::Value, field: &str) -> bool {
+    let raw = json::render(obj)
+    let needle = format!("\"{field}\":")
+    if !raw.contains(needle.as_str()) {
+        return false
+    }
+    let null_mid = format!("\"{field}\":null,")
+    let null_end = format!("\"{field}\":null}}")
+    !raw.contains(null_mid.as_str()) && !raw.contains(null_end.as_str())
+}
+
+/// Parses a JSON config blob and returns the root `Value` after
+/// validating the required fields are present. Errors are
+/// returned as plain `String` because `errors::Error::message`
+/// is not yet bridged into the interp.
+pub fn parse_config(text: &String) -> Result<json::Value, String> {
+    let parsed = json::parse(text)
+    let root = match parsed {
+        Ok(v) => v,
+        Err(_) => return Err("parsing config file: invalid JSON".to_string()),
+    }
+    let missing = missing_config_fields(&root)
+    let mut named: String = "".to_string()
+    let mut count: i64 = 0
+    for entry in missing.iter() {
+        if entry.len() > 0 {
+            if count == 0 {
+                named = entry.to_string()
+            } else {
+                named = named + ", " + entry.as_str()
+            }
+            count = count + 1
+        }
+    }
+    if count > 0 {
+        return Err(format!("missing required configuration values: {named}"))
+    }
+    Ok(root)
+}
+
+/// Reads the config file from disk and parses it. The
+/// filesystem bridge is not yet wired in this Gossamer release;
+/// callers exercising the path-load behaviour at unit-test time
+/// should drive `parse_config` directly with an inline string.
+pub fn load_config(path: &String) -> Result<json::Value, String> {
+    let read = fs::read_to_string(path)
+    let text = match read {
+        Ok(s) => s,
+        Err(_) => return Err(format!("reading config file {path}")),
+    }
+    parse_config(&text)
+}
+
+#[cfg(test)]
+mod config_tests {
+    use std::testing
+
+    const VALID_CFG: &str = r#"{
+"api_spec":"spec.json",
+"latency":{"low_ms":100,"high_ms":1000},
+"responses":[{"path":"/v1/test","body":"override"}],
+"error_response":{"code":500,"body":{"error":"boom"},"frequency_per_10k":500},
+"prefix":"v1"
+}"#
+
+    #[test]
+    fn valid_config_parses() {
+        let s = super::VALID_CFG.to_string()
+        let r = super::parse_config(&s)
+        match r {
+            Ok(v) => {
+                let api: String = v.api_spec
+                let prefix: String = v.prefix
+                let low: i64 = v.latency.low_ms
+                testing::check_eq(&api, &"spec.json".to_string(), "api_spec")
+                testing::check_eq(&prefix, &"v1".to_string(), "prefix")
+                testing::check_eq(&low, &100, "latency.low_ms")
+            }
+            Err(msg) => panic!("expected ok, got err: {}", msg),
+        }
+    }
+
+    #[test]
+    fn missing_required_fields_fail() {
+        let bad = r#"{
+"api_spec":"",
+"latency":{"low_ms":0,"high_ms":0},
+"responses":[],
+"error_response":{"code":0,"body":null,"frequency_per_10k":0},
+"prefix":""
+}"#.to_string()
+        let r = super::parse_config(&bad)
+        match r {
+            Ok(_) => panic!("expected err"),
+            Err(msg) => {
+                testing::check(msg.contains("api_spec"), "names api_spec")
+                testing::check(msg.contains("latency.low_ms"), "names low_ms")
+                testing::check(msg.contains("latency.high_ms"), "names high_ms")
+                testing::check(msg.contains("error_response.frequency_per_10k"), "names freq")
+                testing::check(msg.contains("error_response.code"), "names code")
+                testing::check(msg.contains("error_response.body"), "names body")
+                testing::check(msg.contains("prefix"), "names prefix")
+            }
+        }
+    }
+
+    #[test]
+    fn invalid_json_errors() {
+        let bad = "not valid: json:".to_string()
+        let r = super::parse_config(&bad)
+        match r {
+            Ok(_) => panic!("expected err"),
+            Err(msg) => testing::check(msg.contains("parsing config file"), "wrap msg"),
+        }
+    }
+
+    #[test]
+    fn partial_missing_fields_listed() {
+        let partial = r#"{
+"api_spec":"spec.json",
+"latency":{"low_ms":0,"high_ms":0},
+"responses":[],
+"error_response":{"code":500,"body":null,"frequency_per_10k":1000},
+"prefix":""
+}"#.to_string()
+        let r = super::parse_config(&partial)
+        match r {
+            Ok(_) => panic!("expected err"),
+            Err(msg) => {
+                testing::check(msg.contains("latency.low_ms"), "low_ms")
+                testing::check(msg.contains("latency.high_ms"), "high_ms")
+                testing::check(msg.contains("error_response.body"), "body")
+                testing::check(msg.contains("prefix"), "prefix")
+            }
+        }
+    }
+
+    #[test]
+    fn pick_picks_only_when_missing() {
+        testing::check_eq(&super::pick(true, "x"), &"x".to_string(), "picked")
+        testing::check_eq(&super::pick(false, "x"), &"".to_string(), "skipped")
+    }
+}

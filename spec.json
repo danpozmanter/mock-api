@@ -1,0 +1,6 @@
+{
+  "paths": [
+    {"path": "/chat/completions", "methods": ["POST"]},
+    {"path": "/models",           "methods": ["GET"]}
+  ]
+}

@@ -1,0 +1,133 @@
+/// Linear-congruential PRNG (Knuth's MMIX constants), kept in
+/// pure `i64` arithmetic.
+///
+/// Why hand-rolled: `std::math::rand::Rng`'s methods are not
+/// yet bridged into the interpreter, and the `as` cast between
+/// `i64` and `f64` is currently a bit-reinterpret. Staying in
+/// `i64` sidesteps both.
+///
+/// Methods consume `self` and return a new `Random` plus the
+/// produced value — the caller rebinds. `&mut self` mutations
+/// don't persist back to the caller in this Gossamer release.
+pub struct Random { pub state: i64 }
+
+impl Random {
+    /// Builds a Random seeded with `seed`. Identical seeds
+    /// replay identical streams.
+    pub fn seeded(seed: i64) -> Random {
+        Random { state: seed }
+    }
+
+    /// Advances the state and returns `(next_random, value)`.
+    /// `value` is non-negative.
+    pub fn next_i64(self) -> (Random, i64) {
+        let new_state: i64 = self.state * 6_364_136_223_846_793_005 + 1_442_695_040_888_963_407
+        let positive: i64 = if new_state < 0 { -new_state } else { new_state }
+        let pair: (Random, i64) = (Random { state: new_state }, positive)
+        pair
+    }
+
+    /// Returns `(next_random, value)` where `value` is uniform
+    /// in `[0, bound)`. When `bound <= 0`, returns `0`.
+    pub fn below(self, bound: i64) -> (Random, i64) {
+        if bound <= 0 {
+            let pair: (Random, i64) = (self, 0)
+            return pair
+        }
+        let stepped = self.next_i64()
+        let pair: (Random, i64) = (stepped.0, stepped.1 % bound)
+        pair
+    }
+
+    /// Returns `(next_random, fired)` where `fired` is true with
+    /// probability `numer / denom`.
+    pub fn chance(self, numer: i64, denom: i64) -> (Random, bool) {
+        if denom <= 0 || numer <= 0 {
+            let pair: (Random, bool) = (self, false)
+            return pair
+        }
+        if numer >= denom {
+            let pair: (Random, bool) = (self, true)
+            return pair
+        }
+        let stepped = self.below(denom)
+        let pair: (Random, bool) = (stepped.0, stepped.1 < numer)
+        pair
+    }
+}
+
+#[cfg(test)]
+mod random_tests {
+    use std::testing
+
+    #[test]
+    fn next_i64_is_non_negative() {
+        let mut rng = super::Random::seeded(123)
+        let mut i = 0
+        while i < 1000 {
+            let pair = rng.next_i64()
+            rng = pair.0
+            testing::check(pair.1 >= 0, "non-negative")
+            i = i + 1
+        }
+    }
+
+    #[test]
+    fn identical_seeds_replay() {
+        let mut a = super::Random::seeded(42)
+        let mut b = super::Random::seeded(42)
+        let mut i = 0
+        while i < 16 {
+            let pa = a.next_i64()
+            let pb = b.next_i64()
+            a = pa.0
+            b = pb.0
+            testing::check_eq(&pa.1, &pb.1, "same seed, same stream")
+            i = i + 1
+        }
+    }
+
+    #[test]
+    fn below_stays_in_range() {
+        let mut rng = super::Random::seeded(7)
+        let mut i = 0
+        while i < 1000 {
+            let pair = rng.below(100)
+            rng = pair.0
+            testing::check(pair.1 >= 0, "lower")
+            testing::check(pair.1 < 100, "upper")
+            i = i + 1
+        }
+    }
+
+    #[test]
+    fn chance_zero_never_fires() {
+        let mut rng = super::Random::seeded(99)
+        let mut i = 0
+        while i < 200 {
+            let pair = rng.chance(0, 10_000)
+            rng = pair.0
+            testing::check(!pair.1, "p=0 never fires")
+            i = i + 1
+        }
+    }
+
+    #[test]
+    fn chance_one_always_fires() {
+        let mut rng = super::Random::seeded(99)
+        let mut i = 0
+        while i < 200 {
+            let pair = rng.chance(10_000, 10_000)
+            rng = pair.0
+            testing::check(pair.1, "p=1 always fires")
+            i = i + 1
+        }
+    }
+
+    #[test]
+    fn below_zero_bound_is_zero() {
+        let rng = super::Random::seeded(1)
+        let pair = rng.below(0)
+        testing::check_eq(&pair.1, &0, "zero bound")
+    }
+}

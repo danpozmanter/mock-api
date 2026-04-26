@@ -1,0 +1,189 @@
+/*
+ * mock-api — entry point.
+ *
+ * Each module under `src/` (`config/`, `apispec/`, `simulator/`,
+ * `handler/`, `random/`) is independently testable via
+ * `gos test src/<name>/mod.gos`. This file just wires them
+ * together for the running binary.
+ *
+ * Cross-module method dispatch is currently broken in the
+ * Gossamer interpreter (see `README.md` → "Gossamer-runtime
+ * gotchas"). The boot sequence below typechecks cleanly but
+ * the runtime will return `()` from cross-module calls until
+ * that bridge lands. Tests cover every piece of behaviour from
+ * inside its own module, so the regression surface stays
+ * inside `gos test src/`.
+ */
+
+use std::context
+use std::encoding::json
+use std::http
+use std::os
+use std::time
+
+use config
+use apispec
+use handler
+
+/// Snapshot of the parsed config + spec as plain `i64` /
+/// `String` fields so the request handler doesn't re-walk the
+/// JSON tree on every call.
+pub struct AppConfig {
+    pub low_ms: i64,
+    pub high_ms: i64,
+    pub error_code: i64,
+    pub error_body: String,
+    pub frequency_per_10k: i64,
+    pub prefix: String,
+    pub responses: json::Value,
+    pub spec_paths: json::Value,
+    pub seed: i64,
+}
+
+/// Folds the parsed config and spec into the snapshot the
+/// handler reads from.
+pub fn build_app_config(root: &json::Value, spec: &json::Value) -> AppConfig {
+    let low: i64 = root.latency.low_ms
+    let high: i64 = root.latency.high_ms
+    let code: i64 = root.error_response.code
+    let freq: i64 = root.error_response.frequency_per_10k
+    let prefix: String = root.prefix
+    let body_v = root.error_response.body
+    let resp = root.responses
+    let paths = spec.paths
+    AppConfig {
+        low_ms: low,
+        high_ms: high,
+        error_code: code,
+        error_body: json::render(&body_v),
+        frequency_per_10k: freq,
+        prefix: prefix,
+        responses: resp,
+        spec_paths: paths,
+        seed: time::now() as i64,
+    }
+}
+
+/// HTTP handler. Holds the config snapshot and dispatches
+/// every request through the `handler` module's pure helpers.
+pub struct App {
+    pub cfg: AppConfig,
+}
+
+impl http::Handler for App {
+    fn serve(&self, request: http::Request) -> Result<http::Response, http::Error> {
+        let path: String = request.path.clone()
+        let method: String = request_method_name(&request)
+        let m = handler::match_route(&self.cfg.spec_paths, &self.cfg.prefix, &path, &method)
+        match m {
+            handler::RouteMatch::NotFound => {
+                Ok(handler::json_response(404, handler::error_body("Not found")))
+            }
+            handler::RouteMatch::MethodNotAllowed => {
+                Ok(handler::json_response(405, handler::error_body("Method not allowed")))
+            }
+            handler::RouteMatch::Found => {
+                let lat = handler::get_latency_ms(self.cfg.low_ms, self.cfg.high_ms, self.cfg.seed)
+                let latency: i64 = lat.1
+                if latency > 0 {
+                    time::sleep(latency as u64)
+                }
+                let body = handler::response_body_for(&path, &self.cfg.responses)
+                let resp = if handler::is_streaming_path(&path) {
+                    handler::sse_response(200, handler::build_sse_body(&body))
+                } else {
+                    handler::json_response(200, body)
+                }
+                Ok(resp)
+            }
+        }
+    }
+}
+
+/// Best-effort uppercase method name for `request`. The
+/// runtime's `match` over `http::Method` variants is not yet
+/// wired, so we bottom out with the literal `"GET"` — once the
+/// bridge lands this can pattern-match on `request.method`.
+pub fn request_method_name(request: &http::Request) -> String {
+    let _ = request
+    "GET".to_string()
+}
+
+fn main() -> Result<(), String> {
+    let args = os::args()
+    let mut config_path: String = "config.json".to_string()
+    let mut port: String = "8080".to_string()
+    let n: i64 = args.len() as i64
+    let mut i: i64 = 1
+    while i < n {
+        let a: String = args[i as usize]
+        if a == "--config" && i + 1 < n {
+            config_path = args[(i + 1) as usize]
+            i = i + 2
+        } else if a == "--port" && i + 1 < n {
+            port = args[(i + 1) as usize]
+            i = i + 2
+        } else {
+            i = i + 1
+        }
+    }
+
+    let cfg_load = config::load_config(&config_path)
+    let cfg_root = match cfg_load {
+        Ok(v) => v,
+        Err(msg) => {
+            eprintln!("config error: {}", msg)
+            return Err(msg)
+        }
+    }
+    let spec_url: String = cfg_root.api_spec
+    let spec_load = apispec::load_api_spec(&spec_url)
+    let spec_root = match spec_load {
+        Ok(v) => v,
+        Err(msg) => {
+            eprintln!("spec error: {}", msg)
+            return Err(msg)
+        }
+    }
+    let app_cfg = build_app_config(&cfg_root, &spec_root)
+    let app = App { cfg: app_cfg }
+    let addr = format!("0.0.0.0:{port}")
+    println!("Starting server on {addr}")
+    let r = http::serve(addr, app)
+    match r {
+        Ok(_) => Ok(()),
+        Err(_) => Err("http::serve failed".to_string()),
+    }
+}
+
+#[cfg(test)]
+mod main_tests {
+    use std::encoding::json
+    use std::testing
+
+    fn parse(s: &str) -> json::Value {
+        match json::parse(&s.to_string()) {
+            Ok(v) => v,
+            Err(_) => panic!("bad fixture json"),
+        }
+    }
+
+    #[test]
+    fn build_app_config_copies_scalars() {
+        let cfg = parse(r#"{
+"api_spec":"spec.json",
+"latency":{"low_ms":50,"high_ms":5000},
+"prefix":"v1",
+"responses":[],
+"error_response":{"code":500,"body":{"error":"x"},"frequency_per_10k":1000}
+}"#)
+        let spec = parse(r#"{"paths":[{"path":"/foo","methods":["GET"]}]}"#)
+        let app_cfg = super::build_app_config(&cfg, &spec)
+        testing::check_eq(&app_cfg.low_ms, &50, "low")
+        testing::check_eq(&app_cfg.high_ms, &5000, "high")
+        testing::check_eq(&app_cfg.error_code, &500, "code")
+        testing::check_eq(&app_cfg.frequency_per_10k, &1000, "freq")
+        testing::check_eq(&app_cfg.prefix, &"v1".to_string(), "prefix")
+        testing::check(app_cfg.error_body.contains("error"), "error body rendered")
+    }
+}

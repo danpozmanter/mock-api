@@ -1,0 +1,241 @@
+/// Probabilistic error simulator. Mirrors the Go original's
+/// converging-frequency idea but stays in pure `i64`
+/// arithmetic. `target_per_10k` is the desired error rate as an
+/// integer in `[0, 10_000]`. `should_error` consumes `self` and
+/// returns the updated simulator alongside the decision.
+///
+/// Embeds its own LCG PRNG (`Rng`) — cross-module method
+/// dispatch is currently broken in the Gossamer interpreter, so
+/// every module that needs randomness keeps a local copy. See
+/// `src/random/mod.gos` for the canonical PRNG implementation.
+pub struct ErrorSimulator {
+    pub target_per_10k: i64,
+    pub total_requests: i64,
+    pub total_errors: i64,
+    pub rng_state: i64,
+}
+
+impl ErrorSimulator {
+    /// Builds a simulator with the supplied target rate and
+    /// PRNG seed.
+    pub fn for_rate(target_per_10k: i64, seed: i64) -> ErrorSimulator {
+        ErrorSimulator {
+            target_per_10k: target_per_10k,
+            total_requests: 0,
+            total_errors: 0,
+            rng_state: seed,
+        }
+    }
+
+    /// Returns `(next_sim, fired)`. Tracks the request / error
+    /// counters on the returned simulator and adjusts the live
+    /// probability up or down by 50% relative to the target so
+    /// the observed rate converges over many calls.
+    pub fn should_error(self) -> (ErrorSimulator, bool) {
+        let next_requests: i64 = self.total_requests + 1
+        let target: i64 = self.target_per_10k
+        let errs: i64 = self.total_errors
+        let adjusted: i64 = if errs * 10_000 < target * next_requests {
+            target + target / 2
+        } else if errs * 10_000 > target * next_requests {
+            target / 2
+        } else {
+            target
+        }
+        let stepped = step_rng(self.rng_state)
+        let new_state: i64 = stepped.0
+        let bucket: i64 = stepped.1 % 10_000
+        let fired: bool = if adjusted <= 0 {
+            false
+        } else if adjusted >= 10_000 {
+            true
+        } else {
+            bucket < adjusted
+        }
+        let next_errors: i64 = if fired { self.total_errors + 1 } else { self.total_errors }
+        let next_sim = ErrorSimulator {
+            target_per_10k: self.target_per_10k,
+            total_requests: next_requests,
+            total_errors: next_errors,
+            rng_state: new_state,
+        }
+        let pair: (ErrorSimulator, bool) = (next_sim, fired)
+        pair
+    }
+
+    /// Returns the observed error count divided by request
+    /// count, expressed as `per_10k`. Returns `0` before any
+    /// requests are made.
+    pub fn observed_per_10k(&self) -> i64 {
+        if self.total_requests <= 0 {
+            return 0
+        }
+        self.total_errors * 10_000 / self.total_requests
+    }
+}
+
+/// Advances an LCG state and returns the new state plus a
+/// non-negative value. Embedded here so the simulator stays
+/// self-sufficient under cross-module dispatch failures.
+pub fn step_rng(state: i64) -> (i64, i64) {
+    let new_state: i64 = state * 6_364_136_223_846_793_005 + 1_442_695_040_888_963_407
+    let positive: i64 = if new_state < 0 { -new_state } else { new_state }
+    let pair: (i64, i64) = (new_state, positive)
+    pair
+}
+
+#[cfg(test)]
+mod simulator_tests {
+    use std::testing
+
+    #[test]
+    fn new_zero_target() {
+        let sim = super::ErrorSimulator::for_rate(0, 1)
+        testing::check_eq(&sim.target_per_10k, &0, "target")
+        testing::check_eq(&sim.total_requests, &0, "requests")
+        testing::check_eq(&sim.total_errors, &0, "errors")
+    }
+
+    #[test]
+    fn new_half_target() {
+        let sim = super::ErrorSimulator::for_rate(5000, 1)
+        testing::check_eq(&sim.target_per_10k, &5000, "target")
+    }
+
+    #[test]
+    fn new_full_target() {
+        let sim = super::ErrorSimulator::for_rate(10_000, 1)
+        testing::check_eq(&sim.target_per_10k, &10_000, "target")
+    }
+
+    #[test]
+    fn observed_per_10k_no_requests() {
+        let sim = super::ErrorSimulator::for_rate(5000, 1)
+        testing::check_eq(&sim.observed_per_10k(), &0, "no requests")
+    }
+
+    #[test]
+    fn observed_per_10k_no_errors() {
+        let mut sim = super::ErrorSimulator::for_rate(5000, 1)
+        sim.total_requests = 100
+        sim.total_errors = 0
+        testing::check_eq(&sim.observed_per_10k(), &0, "no errors")
+    }
+
+    #[test]
+    fn observed_per_10k_all_errors() {
+        let mut sim = super::ErrorSimulator::for_rate(5000, 1)
+        sim.total_requests = 100
+        sim.total_errors = 100
+        testing::check_eq(&sim.observed_per_10k(), &10_000, "all errors")
+    }
+
+    #[test]
+    fn observed_per_10k_half_errors() {
+        let mut sim = super::ErrorSimulator::for_rate(5000, 1)
+        sim.total_requests = 100
+        sim.total_errors = 50
+        testing::check_eq(&sim.observed_per_10k(), &5000, "half errors")
+    }
+
+    #[test]
+    fn should_error_zero_target_never_fires() {
+        let mut sim = super::ErrorSimulator::for_rate(0, 7)
+        let mut i = 0
+        while i < 500 {
+            let pair = sim.should_error()
+            sim = pair.0
+            testing::check(!pair.1, "p=0")
+            i = i + 1
+        }
+        testing::check_eq(&sim.total_errors, &0, "no errors recorded")
+        testing::check_eq(&sim.total_requests, &500, "all requests counted")
+    }
+
+    #[test]
+    fn should_error_full_target_always_fires() {
+        let mut sim = super::ErrorSimulator::for_rate(10_000, 7)
+        let mut i = 0
+        while i < 500 {
+            let pair = sim.should_error()
+            sim = pair.0
+            testing::check(pair.1, "p=1")
+            i = i + 1
+        }
+        testing::check_eq(&sim.total_errors, &500, "every request errored")
+    }
+
+    #[test]
+    fn should_error_quarter_converges() {
+        let mut sim = super::ErrorSimulator::for_rate(2500, 99)
+        let mut i = 0
+        while i < 1000 {
+            let pair = sim.should_error()
+            sim = pair.0
+            i = i + 1
+        }
+        let observed = sim.observed_per_10k()
+        let diff = if observed > 2500 { observed - 2500 } else { 2500 - observed }
+        testing::check(diff < 500, "within 5% of 25%")
+    }
+
+    #[test]
+    fn should_error_half_converges() {
+        let mut sim = super::ErrorSimulator::for_rate(5000, 99)
+        let mut i = 0
+        while i < 1000 {
+            let pair = sim.should_error()
+            sim = pair.0
+            i = i + 1
+        }
+        let observed = sim.observed_per_10k()
+        let diff = if observed > 5000 { observed - 5000 } else { 5000 - observed }
+        testing::check(diff < 500, "within 5% of 50%")
+    }
+
+    #[test]
+    fn should_error_three_quarter_converges() {
+        let mut sim = super::ErrorSimulator::for_rate(7500, 99)
+        let mut i = 0
+        while i < 1000 {
+            let pair = sim.should_error()
+            sim = pair.0
+            i = i + 1
+        }
+        let observed = sim.observed_per_10k()
+        let diff = if observed > 7500 { observed - 7500 } else { 7500 - observed }
+        testing::check(diff < 500, "within 5% of 75%")
+    }
+
+    #[test]
+    fn should_error_below_target_increases_rate() {
+        let mut sim = super::ErrorSimulator::for_rate(5000, 7)
+        sim.total_requests = 100
+        sim.total_errors = 25
+        let mut count: i64 = 0
+        let mut i = 0
+        while i < 100 {
+            let pair = sim.should_error()
+            sim = pair.0
+            if pair.1 { count = count + 1 }
+            i = i + 1
+        }
+        testing::check(count > 50, "below-target should increase fire rate")
+    }
+
+    #[test]
+    fn should_error_above_target_decreases_rate() {
+        let mut sim = super::ErrorSimulator::for_rate(5000, 7)
+        sim.total_requests = 100
+        sim.total_errors = 75
+        let mut count: i64 = 0
+        let mut i = 0
+        while i < 100 {
+            let pair = sim.should_error()
+            sim = pair.0
+            if pair.1 { count = count + 1 }
+            i = i + 1
+        }
+        testing::check(count < 50, "above-target should decrease fire rate")
+    }
+}

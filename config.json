@@ -1,0 +1,48 @@
+{
+  "api_spec": "spec.json",
+  "latency": {
+    "low_ms": 50,
+    "high_ms": 5000
+  },
+  "prefix": "v1",
+  "responses": [
+    {
+      "path": "/v1/chat/completions",
+      "body": {
+        "id": "chatcmpl-123",
+        "object": "chat.completion",
+        "created": 1677652288,
+        "model": "gpt-3.5-turbo",
+        "usage": {
+          "prompt_tokens": 78,
+          "completion_tokens": 101,
+          "total_tokens": 179
+        },
+        "choices": [
+          {
+            "index": 0,
+            "message": {
+              "role": "assistant",
+              "content": "Hello there!"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "path": "/v1/models",
+      "body": {
+        "object": "list",
+        "data": [
+          {"id": "gpt-3.5-turbo", "object": "model", "created": 1677610602},
+          {"id": "gpt-4", "object": "model", "created": 1677610602}
+        ]
+      }
+    }
+  ],
+  "error_response": {
+    "code": 500,
+    "body": {"error": "simulated error occurred"},
+    "frequency_per_10k": 1000
+  }
+}

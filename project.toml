@@ -1,0 +1,5 @@
+[project]
+id = "github.com/danpozmanter/mock-api"
+version = "0.1.0"
+
+[dependencies]
