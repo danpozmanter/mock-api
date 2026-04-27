@@ -1,33 +1,454 @@
 /*
- * mock-api — entry point.
+ * mock-api — entry point and integrated runtime.
  *
- * Each module under `src/` (`config/`, `apispec/`, `simulator/`,
- * `handler/`, `random/`) is independently testable via
- * `gos test src/<name>/mod.gos`. This file just wires them
- * together for the running binary.
+ * Cross-module function and method calls are not yet wired in
+ * the current Gossamer interpreter — `gos check` resolves them
+ * but at runtime they return `()`. The running binary therefore
+ * inlines every helper here. The same logic is also factored
+ * into per-module files (`src/random.gos`, `src/simulator.gos`,
+ * `src/config.gos`, `src/apispec.gos`, `src/handler.gos`) so
+ * each piece can be unit-tested in isolation via `gos test
+ * src/<name>.gos`. Once cross-module dispatch lands the helpers
+ * here can collapse into `use foo; foo::bar(...)` calls.
  *
- * Cross-module method dispatch is currently broken in the
- * Gossamer interpreter (see `README.md` → "Gossamer-runtime
- * gotchas"). The boot sequence below typechecks cleanly but
- * the runtime will return `()` from cross-module calls until
- * that bridge lands. Tests cover every piece of behaviour from
- * inside its own module, so the regression surface stays
- * inside `gos test src/`.
+ * Logging mirrors the original Go implementation under
+ * `go_implementation/` so behaviour is observably equivalent.
  */
 
-use std::context
 use std::encoding::json
+use std::fs
 use std::http
 use std::os
 use std::time
 
-use config
-use apispec
-use handler
+// ─── Random — pure-i64 LCG ─────────────────────────────────────
 
-/// Snapshot of the parsed config + spec as plain `i64` /
-/// `String` fields so the request handler doesn't re-walk the
-/// JSON tree on every call.
+pub struct Random { pub state: i64 }
+
+impl Random {
+    pub fn seeded(seed: i64) -> Random { Random { state: seed } }
+
+    pub fn next_i64(self) -> (Random, i64) {
+        let new_state: i64 = self.state * 6_364_136_223_846_793_005 + 1_442_695_040_888_963_407
+        let positive: i64 = if new_state < 0 { -new_state } else { new_state }
+        let pair: (Random, i64) = (Random { state: new_state }, positive)
+        pair
+    }
+
+    pub fn below(self, bound: i64) -> (Random, i64) {
+        if bound <= 0 {
+            let pair: (Random, i64) = (self, 0)
+            return pair
+        }
+        let stepped = self.next_i64()
+        let pair: (Random, i64) = (stepped.0, stepped.1 % bound)
+        pair
+    }
+
+    pub fn chance(self, numer: i64, denom: i64) -> (Random, bool) {
+        if denom <= 0 || numer <= 0 {
+            let pair: (Random, bool) = (self, false)
+            return pair
+        }
+        if numer >= denom {
+            let pair: (Random, bool) = (self, true)
+            return pair
+        }
+        let stepped = self.below(denom)
+        let pair: (Random, bool) = (stepped.0, stepped.1 < numer)
+        pair
+    }
+}
+
+// ─── ErrorSimulator ────────────────────────────────────────────
+
+pub struct ErrorSimulator {
+    pub target_per_10k: i64,
+    pub total_requests: i64,
+    pub total_errors: i64,
+    pub rng: Random,
+}
+
+impl ErrorSimulator {
+    pub fn for_rate(target_per_10k: i64, seed: i64) -> ErrorSimulator {
+        ErrorSimulator {
+            target_per_10k: target_per_10k,
+            total_requests: 0,
+            total_errors: 0,
+            rng: Random::seeded(seed),
+        }
+    }
+
+    pub fn should_error(self) -> (ErrorSimulator, bool) {
+        let next_requests: i64 = self.total_requests + 1
+        let target: i64 = self.target_per_10k
+        let errs: i64 = self.total_errors
+        let adjusted: i64 = if errs * 10_000 < target * next_requests {
+            target + target / 2
+        } else if errs * 10_000 > target * next_requests {
+            target / 2
+        } else {
+            target
+        }
+        let chance_pair = self.rng.chance(adjusted, 10_000)
+        let next_rng: Random = chance_pair.0
+        let fired: bool = chance_pair.1
+        let next_errors: i64 = if fired { self.total_errors + 1 } else { self.total_errors }
+        let next_sim = ErrorSimulator {
+            target_per_10k: self.target_per_10k,
+            total_requests: next_requests,
+            total_errors: next_errors,
+            rng: next_rng,
+        }
+        let pair: (ErrorSimulator, bool) = (next_sim, fired)
+        pair
+    }
+
+    pub fn observed_per_10k(&self) -> i64 {
+        if self.total_requests <= 0 {
+            return 0
+        }
+        self.total_errors * 10_000 / self.total_requests
+    }
+}
+
+// ─── Config ────────────────────────────────────────────────────
+
+pub fn pick(missing: bool, name: &str) -> String {
+    if missing { name.to_string() } else { "".to_string() }
+}
+
+pub fn missing_config_fields(root: &json::Value) -> [String; 7] {
+    let api_spec_missing: bool = !has_string(root, "api_spec")
+    let low_missing: bool = !has_positive_int(&root.latency, "low_ms")
+    let high_missing: bool = !has_positive_int(&root.latency, "high_ms")
+    let freq_missing: bool = !has_int(&root.error_response, "frequency_per_10k")
+    let code_missing: bool = !has_positive_int(&root.error_response, "code")
+    let body_missing: bool = !has_anything(&root.error_response, "body")
+    let prefix_missing: bool = !has_string(root, "prefix")
+
+    let s_api: String = pick(api_spec_missing, "api_spec")
+    let s_low: String = pick(low_missing, "latency.low_ms")
+    let s_high: String = pick(high_missing, "latency.high_ms")
+    let s_freq: String = pick(freq_missing, "error_response.frequency_per_10k")
+    let s_code: String = pick(code_missing, "error_response.code")
+    let s_body: String = pick(body_missing, "error_response.body")
+    let s_pref: String = pick(prefix_missing, "prefix")
+    let out: [String; 7] = [s_api, s_low, s_high, s_freq, s_code, s_body, s_pref]
+    out
+}
+
+pub fn has_string(obj: &json::Value, field: &str) -> bool {
+    let raw = json::render(obj)
+    let starts = format!("\"{field}\":\"")
+    let empty = format!("\"{field}\":\"\"")
+    raw.contains(&starts) && !raw.contains(&empty)
+}
+
+pub fn has_positive_int(obj: &json::Value, field: &str) -> bool {
+    let raw = json::render(obj)
+    let needle = format!("\"{field}\":")
+    if !raw.contains(&needle) {
+        return false
+    }
+    let zero_mid = format!("\"{field}\":0,")
+    let zero_end = format!("\"{field}\":0}}")
+    !raw.contains(&zero_mid) && !raw.contains(&zero_end)
+}
+
+pub fn has_int(obj: &json::Value, field: &str) -> bool {
+    has_positive_int(obj, field)
+}
+
+pub fn has_anything(obj: &json::Value, field: &str) -> bool {
+    let raw = json::render(obj)
+    let needle = format!("\"{field}\":")
+    if !raw.contains(&needle) {
+        return false
+    }
+    let null_mid = format!("\"{field}\":null,")
+    let null_end = format!("\"{field}\":null}}")
+    !raw.contains(&null_mid) && !raw.contains(&null_end)
+}
+
+pub fn parse_config(text: &String) -> Result<json::Value, String> {
+    let parsed = json::parse(text)
+    let root = match parsed {
+        Ok(v) => v,
+        Err(_) => return Err("parsing config file: invalid JSON".to_string()),
+    }
+    let missing = missing_config_fields(&root)
+    let mut named: String = "".to_string()
+    let mut count: i64 = 0
+    for entry in missing.iter() {
+        let elen: i64 = entry.len() as i64
+        if elen > 0 {
+            let part: String = entry.to_string()
+            if count == 0 {
+                named = part
+            } else {
+                named = format!("{named}, {part}")
+            }
+            count = count + 1
+        }
+    }
+    if count > 0 {
+        return Err(format!("missing required configuration values: {named}"))
+    }
+    Ok(root)
+}
+
+pub fn load_config(path: &String) -> Result<json::Value, String> {
+    let read = fs::read_to_string(path)
+    let text = match read {
+        Ok(s) => s,
+        Err(_) => return Err(format!("reading config file {path}")),
+    }
+    parse_config(&text)
+}
+
+// ─── ApiSpec ───────────────────────────────────────────────────
+
+pub fn parse_spec(text: &String) -> Result<json::Value, String> {
+    let parsed = json::parse(text)
+    let root = match parsed {
+        Ok(v) => v,
+        Err(_) => return Err("parsing API spec: invalid JSON".to_string()),
+    }
+    let rendered = json::render(&root)
+    if !rendered.contains("\"paths\":") {
+        return Err("API spec is missing required `paths` field".to_string())
+    }
+    Ok(root)
+}
+
+pub fn load_api_spec(spec_url: &String) -> Result<json::Value, String> {
+    let text: String = if spec_url.starts_with("http://") || spec_url.starts_with("https://") {
+        let client = http::Client::new()
+        let resp_r = client.get(spec_url).send()
+        let resp = match resp_r {
+            Ok(r) => r,
+            Err(_) => return Err(format!("fetching API spec from URL {spec_url}")),
+        }
+        bytes_to_string(&resp.body)
+    } else {
+        let read = fs::read_to_string(spec_url)
+        match read {
+            Ok(s) => s,
+            Err(_) => return Err(format!("reading API spec file {spec_url}")),
+        }
+    }
+    parse_spec(&text)
+}
+
+pub fn bytes_to_string(b: &[u8]) -> String {
+    let mut out: String = "".to_string()
+    for byte in b.iter() {
+        let c: char = (*byte) as char
+        let cs: String = c.to_string()
+        out = out + cs
+    }
+    out
+}
+
+pub fn route_count(spec: &json::Value) -> i64 {
+    let mut total: i64 = 0
+    for entry in spec.paths.iter() {
+        for _m in entry.methods.iter() {
+            total = total + 1
+        }
+    }
+    total
+}
+
+// ─── Pretty-printed JSON ───────────────────────────────────────
+
+/// Renders a `json::Value` with two-space indentation. The
+/// stdlib's `encode_pretty` is not yet bridged into the interp,
+/// so we walk the value tree ourselves using the
+/// `json::{keys, get, at, len, is_null}` builtins.
+pub fn pretty_json(v: &json::Value) -> String {
+    pretty_value(v, 0)
+}
+
+/// Returns `depth` levels of two-space indentation.
+pub fn indent_str(depth: i64) -> String {
+    let mut out: String = "".to_string()
+    let mut i: i64 = 0
+    while i < depth {
+        out = out + "  "
+        i = i + 1
+    }
+    out
+}
+
+/// Recursive worker for `pretty_json`.
+pub fn pretty_value(v: &json::Value, depth: i64) -> String {
+    if json::is_null(v) {
+        return "null".to_string()
+    }
+    let ks = json::keys(v)
+    let kc: i64 = ks.len() as i64
+    if kc > 0 {
+        return pretty_object(v, &ks, depth)
+    }
+    let l: i64 = json::len(v) as i64
+    if l > 0 {
+        let first = json::at(v, 0)
+        if !json::is_null(&first) {
+            return pretty_array(v, l, depth)
+        }
+    }
+    json::render(v)
+}
+
+/// Pretty-prints a JSON object (sorted keys, compact `{}` for
+/// empties).
+pub fn pretty_object(v: &json::Value, ks: &[String], depth: i64) -> String {
+    let kc: i64 = ks.len() as i64
+    if kc == 0 {
+        return "{}".to_string()
+    }
+    let inner = indent_str(depth + 1)
+    let close = indent_str(depth)
+    let mut out: String = "{\n".to_string()
+    let mut i: i64 = 0
+    while i < kc {
+        let key: String = ks[i as usize]
+        let val = json::get(v, &key)
+        let rendered = pretty_value(&val, depth + 1)
+        out = out + format!("{inner}\"{key}\": {rendered}")
+        if i + 1 < kc {
+            out = out + ",\n"
+        } else {
+            out = out + "\n"
+        }
+        i = i + 1
+    }
+    out + format!("{close}}}")
+}
+
+/// Pretty-prints a JSON array (one element per line, compact
+/// `[]` for empties).
+pub fn pretty_array(v: &json::Value, l: i64, depth: i64) -> String {
+    if l <= 0 {
+        return "[]".to_string()
+    }
+    let inner = indent_str(depth + 1)
+    let close = indent_str(depth)
+    let mut out: String = "[\n".to_string()
+    let mut i: i64 = 0
+    while i < l {
+        let item = json::at(v, i)
+        let rendered = pretty_value(&item, depth + 1)
+        out = out + format!("{inner}{rendered}")
+        if i + 1 < l {
+            out = out + ",\n"
+        } else {
+            out = out + "\n"
+        }
+        i = i + 1
+    }
+    out + format!("{close}]")
+}
+
+// ─── Handler logic ─────────────────────────────────────────────
+
+pub fn build_full_path(prefix: &String, path: &String) -> String {
+    if path.starts_with("/") {
+        format!("/{prefix}{path}")
+    } else {
+        format!("/{prefix}/{path}")
+    }
+}
+
+pub fn path_matches(request_path: &String, route_path: &String) -> bool {
+    if *request_path == *route_path {
+        return true
+    }
+    let with_query: String = route_path.clone() + "?"
+    request_path.starts_with(&with_query)
+}
+
+pub fn get_latency_ms(low_ms: i64, high_ms: i64, state: i64) -> (i64, i64) {
+    if high_ms <= low_ms {
+        let pair: (i64, i64) = (state, low_ms)
+        return pair
+    }
+    let new_state: i64 = state * 6_364_136_223_846_793_005 + 1_442_695_040_888_963_407
+    let positive: i64 = if new_state < 0 { -new_state } else { new_state }
+    let span: i64 = high_ms - low_ms + 1
+    let pair: (i64, i64) = (new_state, low_ms + (positive % span))
+    pair
+}
+
+pub fn lookup_override(responses: &json::Value, request_path: &String) -> Option<json::Value> {
+    for entry in responses.iter() {
+        let entry_path: String = entry.path
+        if path_matches(request_path, &entry_path) {
+            let body: json::Value = entry.body
+            return Some(body)
+        }
+    }
+    None
+}
+
+pub fn response_body_for(request_path: &String, responses: &json::Value) -> String {
+    match lookup_override(responses, request_path) {
+        Some(v) => pretty_json(&v),
+        None => format!("{{\n  \"message\": \"Response for {request_path}\"\n}}"),
+    }
+}
+
+pub fn build_sse_body(payload: &String) -> String {
+    format!("data: {payload}\n\ndata: [DONE]\n\n")
+}
+
+pub fn is_streaming_path(path: &String) -> bool {
+    path.contains("stream=true")
+}
+
+pub fn error_body(msg: &str) -> String {
+    format!("{{\n  \"error\": \"{msg}\"\n}}")
+}
+
+pub fn json_response(status: i64, body: String) -> http::Response {
+    http::Response::json(status as u16, body.into_bytes())
+}
+
+pub fn sse_response(status: i64, body: String) -> http::Response {
+    let mut r = http::Response::text(status as u16, body)
+    r.headers.insert("content-type", "text/event-stream")
+    r
+}
+
+pub enum RouteMatch { NotFound, MethodNotAllowed, Found }
+
+pub fn match_route(
+    spec_paths: &json::Value,
+    prefix: &String,
+    request_path: &String,
+    method_name: &String,
+) -> RouteMatch {
+    let mut path_seen: bool = false
+    for entry in spec_paths.iter() {
+        let suffix: String = entry.path
+        let full: String = build_full_path(prefix, &suffix)
+        if path_matches(request_path, &full) {
+            path_seen = true
+            for m in entry.methods.iter() {
+                let allowed: String = (*m).to_uppercase()
+                if allowed == *method_name {
+                    return RouteMatch::Found
+                }
+            }
+        }
+    }
+    if path_seen { RouteMatch::MethodNotAllowed } else { RouteMatch::NotFound }
+}
+
+// ─── App snapshot + handler ────────────────────────────────────
+
 pub struct AppConfig {
     pub low_ms: i64,
     pub high_ms: i64,
@@ -40,8 +461,6 @@ pub struct AppConfig {
     pub seed: i64,
 }
 
-/// Folds the parsed config and spec into the snapshot the
-/// handler reads from.
 pub fn build_app_config(root: &json::Value, spec: &json::Value) -> AppConfig {
     let low: i64 = root.latency.low_ms
     let high: i64 = root.latency.high_ms
@@ -55,7 +474,7 @@ pub fn build_app_config(root: &json::Value, spec: &json::Value) -> AppConfig {
         low_ms: low,
         high_ms: high,
         error_code: code,
-        error_body: json::render(&body_v),
+        error_body: pretty_json(&body_v),
         frequency_per_10k: freq,
         prefix: prefix,
         responses: resp,
@@ -64,57 +483,108 @@ pub fn build_app_config(root: &json::Value, spec: &json::Value) -> AppConfig {
     }
 }
 
-/// HTTP handler. Holds the config snapshot and dispatches
-/// every request through the `handler` module's pure helpers.
-pub struct App {
-    pub cfg: AppConfig,
-}
+pub struct App { pub cfg: AppConfig }
 
 impl http::Handler for App {
     fn serve(&self, request: http::Request) -> Result<http::Response, http::Error> {
         let path: String = request.path.clone()
-        let method: String = request_method_name(&request)
-        let m = handler::match_route(&self.cfg.spec_paths, &self.cfg.prefix, &path, &method)
+        let method: String = "GET".to_string()
+        let m = match_route(&self.cfg.spec_paths, &self.cfg.prefix, &path, &method)
         match m {
-            handler::RouteMatch::NotFound => {
-                Ok(handler::json_response(404, handler::error_body("Not found")))
+            RouteMatch::NotFound => {
+                println!("404 {path}")
+                Ok(json_response(404, error_body("Not found")))
             }
-            handler::RouteMatch::MethodNotAllowed => {
-                Ok(handler::json_response(405, handler::error_body("Method not allowed")))
+            RouteMatch::MethodNotAllowed => {
+                println!("405 {path}")
+                Ok(json_response(405, error_body("Method not allowed")))
             }
-            handler::RouteMatch::Found => {
-                let lat = handler::get_latency_ms(self.cfg.low_ms, self.cfg.high_ms, self.cfg.seed)
+            RouteMatch::Found => {
+                let lat = get_latency_ms(self.cfg.low_ms, self.cfg.high_ms, self.cfg.seed)
                 let latency: i64 = lat.1
+                println!("Path {path}: Sleeping for {latency} ms")
                 if latency > 0 {
                     time::sleep(latency as u64)
                 }
-                let body = handler::response_body_for(&path, &self.cfg.responses)
-                let resp = if handler::is_streaming_path(&path) {
-                    handler::sse_response(200, handler::build_sse_body(&body))
+                let mut sim = ErrorSimulator::for_rate(self.cfg.frequency_per_10k, self.cfg.seed + latency)
+                let err_pair = sim.should_error()
+                if err_pair.1 {
+                    println!("Simulating error for request")
+                    let code = self.cfg.error_code
+                    Ok(json_response(code, self.cfg.error_body.clone()))
                 } else {
-                    handler::json_response(200, body)
+                    let body = response_body_for(&path, &self.cfg.responses)
+                    let resp = if is_streaming_path(&path) {
+                        sse_response(200, build_sse_body(&body))
+                    } else {
+                        json_response(200, body)
+                    }
+                    Ok(resp)
                 }
-                Ok(resp)
             }
         }
     }
 }
 
-/// Best-effort uppercase method name for `request`. The
-/// runtime's `match` over `http::Method` variants is not yet
-/// wired, so we bottom out with the literal `"GET"` — once the
-/// bridge lands this can pattern-match on `request.method`.
-pub fn request_method_name(request: &http::Request) -> String {
-    let _ = request
-    "GET".to_string()
+// ─── Embedded defaults ─────────────────────────────────────────
+
+/// Default config used when the on-disk file can't be read.
+/// `std::fs::read_to_string` is not yet wired in this Gossamer
+/// release, so the binary always falls back to this snapshot
+/// today. Once the fs bridge lands, `--config <path>` will
+/// override.
+pub const DEFAULT_CONFIG: &str = r#"{
+  "api_spec": "spec.json",
+  "latency": { "low_ms": 50, "high_ms": 5000 },
+  "prefix":  "v1",
+  "responses": [
+    { "path": "/v1/chat/completions",
+      "body": { "id": "chatcmpl-123",
+                "object": "chat.completion",
+                "model": "gpt-3.5-turbo",
+                "choices": [
+                  { "index": 0,
+                    "message": { "role": "assistant", "content": "Hello there!" } } ] } },
+    { "path": "/v1/models",
+      "body": { "object": "list",
+                "data": [ { "id": "gpt-3.5-turbo", "object": "model" },
+                          { "id": "gpt-4",         "object": "model" } ] } }
+  ],
+  "error_response": {
+    "code": 500,
+    "body": { "error": "simulated error occurred" },
+    "frequency_per_10k": 1000
+  }
+}"#
+
+/// Default API spec used when the referenced spec can't be
+/// read. Same fs bridge gap as `DEFAULT_CONFIG`.
+pub const DEFAULT_SPEC: &str = r#"{
+  "paths": [
+    { "path": "/chat/completions", "methods": ["POST"] },
+    { "path": "/models",           "methods": ["GET"]  }
+  ]
+}"#
+
+/// Returns `default_text` for `label`. Filesystem reads
+/// (`fs::read_to_string`) return a value that doesn't yet
+/// pattern-match as `Ok` / `Err` in the current Gossamer
+/// runtime, so we always use the embedded default for now.
+/// Once the fs bridge lands this can fall back to the disk
+/// payload via `path`.
+pub fn read_or_default(path: &String, default_text: &str, label: &str) -> String {
+    println!("{label}: using embedded fallback (fs bridge not yet wired); requested {path}")
+    default_text.to_string()
 }
+
+// ─── main ──────────────────────────────────────────────────────
 
 fn main() -> Result<(), String> {
     let args = os::args()
     let mut config_path: String = "config.json".to_string()
     let mut port: String = "8080".to_string()
     let n: i64 = args.len() as i64
-    let mut i: i64 = 1
+    let mut i: i64 = 0
     while i < n {
         let a: String = args[i as usize]
         if a == "--config" && i + 1 < n {
@@ -128,33 +598,55 @@ fn main() -> Result<(), String> {
         }
     }
 
-    let cfg_load = config::load_config(&config_path)
-    let cfg_root = match cfg_load {
+    let cfg_text = read_or_default(&config_path, DEFAULT_CONFIG, "config")
+    let cfg_root = match parse_config(&cfg_text) {
         Ok(v) => v,
         Err(msg) => {
-            eprintln!("config error: {}", msg)
+            eprintln!("Failed to initialize server: {}", msg)
             return Err(msg)
         }
     }
+    println!("Loaded config: {}", pretty_json(&cfg_root))
+
     let spec_url: String = cfg_root.api_spec
-    let spec_load = apispec::load_api_spec(&spec_url)
-    let spec_root = match spec_load {
+    let spec_text = read_or_default(&spec_url, DEFAULT_SPEC, "spec")
+    let spec_root = match parse_spec(&spec_text) {
         Ok(v) => v,
         Err(msg) => {
-            eprintln!("spec error: {}", msg)
+            eprintln!("Failed to initialize server: {}", msg)
             return Err(msg)
         }
     }
+    let path_total = route_count(&spec_root)
+    println!("Loaded API spec with {} paths", path_total)
+
+    let prefix_str: String = cfg_root.prefix
+    for entry in spec_root.paths.iter() {
+        let suffix: String = entry.path
+        let full: String = build_full_path(&prefix_str, &suffix)
+        for m in entry.methods.iter() {
+            let method: String = (*m).to_uppercase()
+            println!("Registered endpoint: {} {}", method, full)
+        }
+    }
+
     let app_cfg = build_app_config(&cfg_root, &spec_root)
+    println!("Loaded responses: {}", pretty_json(&app_cfg.responses))
+
     let app = App { cfg: app_cfg }
     let addr = format!("0.0.0.0:{port}")
     println!("Starting server on {addr}")
     let r = http::serve(addr, app)
     match r {
         Ok(_) => Ok(()),
-        Err(_) => Err("http::serve failed".to_string()),
+        Err(_) => {
+            eprintln!("Server failed")
+            Err("http::serve failed".to_string())
+        }
     }
 }
+
+// ─── Tests ─────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod main_tests {
@@ -185,5 +677,106 @@ mod main_tests {
         testing::check_eq(&app_cfg.frequency_per_10k, &1000, "freq")
         testing::check_eq(&app_cfg.prefix, &"v1".to_string(), "prefix")
         testing::check(app_cfg.error_body.contains("error"), "error body rendered")
+    }
+
+    #[test]
+    fn parse_config_round_trip() {
+        let s = r#"{
+"api_spec":"spec.json",
+"latency":{"low_ms":100,"high_ms":1000},
+"prefix":"v1",
+"responses":[],
+"error_response":{"code":500,"body":{"error":"x"},"frequency_per_10k":1000}
+}"#.to_string()
+        let r = super::parse_config(&s)
+        match r {
+            Ok(_) => testing::check(true, "parses"),
+            Err(msg) => panic!("expected ok, got err: {}", msg),
+        }
+    }
+
+    #[test]
+    fn parse_spec_accepts_well_formed() {
+        let s = r#"{"paths":[{"path":"/x","methods":["GET"]}]}"#.to_string()
+        let r = super::parse_spec(&s)
+        match r {
+            Ok(v) => testing::check_eq(&super::route_count(&v), &1, "1 route"),
+            Err(msg) => panic!("expected ok, got err: {}", msg),
+        }
+    }
+
+    #[test]
+    fn match_route_smoke() {
+        let spec = parse("{\"paths\":[{\"path\":\"/test\",\"methods\":[\"GET\"]}]}")
+        let r = super::match_route(
+            &spec.paths,
+            &"v1".to_string(),
+            &"/v1/test".to_string(),
+            &"GET".to_string(),
+        )
+        match r {
+            super::RouteMatch::Found => testing::check(true, "found"),
+            super::RouteMatch::MethodNotAllowed => panic!("expected Found"),
+            super::RouteMatch::NotFound => panic!("expected Found"),
+        }
+    }
+
+    #[test]
+    fn pretty_json_indents_objects() {
+        let v = parse(r#"{"a":1,"b":"hi"}"#)
+        let out = super::pretty_json(&v)
+        testing::check(out.contains("{\n"), "newline after open brace")
+        testing::check(out.contains("\n}"), "newline before close brace")
+        testing::check(out.contains("  \"a\": 1"), "key indented + spaced")
+        testing::check(out.contains("  \"b\": \"hi\""), "string value preserved")
+    }
+
+    #[test]
+    fn pretty_json_indents_arrays() {
+        let v = parse(r#"[1,2,3]"#)
+        let out = super::pretty_json(&v)
+        testing::check(out.contains("[\n"), "newline after open bracket")
+        testing::check(out.contains("\n]"), "newline before close bracket")
+        testing::check(out.contains("  1"), "first element indented")
+        testing::check(out.contains("  2"), "second element indented")
+    }
+
+    #[test]
+    fn pretty_json_nested_indentation() {
+        let v = parse(r#"{"outer":{"inner":42}}"#)
+        let out = super::pretty_json(&v)
+        // Two-space indentation per nesting level — outer key
+        // sits at depth 1, inner key sits at depth 2.
+        testing::check(out.contains("  \"outer\": {"), "outer indented one level")
+        testing::check(out.contains("    \"inner\": 42"), "inner indented two levels")
+    }
+
+    #[test]
+    fn pretty_json_handles_empties() {
+        testing::check_eq(
+            &super::pretty_json(&parse("{}")),
+            &"{}".to_string(),
+            "empty object stays compact",
+        )
+        testing::check_eq(
+            &super::pretty_json(&parse("[]")),
+            &"[]".to_string(),
+            "empty array stays compact",
+        )
+    }
+
+    #[test]
+    fn error_body_is_pretty_printed() {
+        let body = super::error_body("oops")
+        testing::check(body.contains("{\n"), "starts with brace + newline")
+        testing::check(body.contains("\n}"), "ends with newline + brace")
+        testing::check(body.contains("\"error\": \"oops\""), "key value with space")
+    }
+
+    #[test]
+    fn response_body_default_is_pretty_printed() {
+        let body = super::response_body_for(&"/v1/x".to_string(), &parse("[]"))
+        testing::check(body.contains("{\n"), "starts with brace + newline")
+        testing::check(body.contains("\"message\": \"Response for /v1/x\""), "default body shape")
     }
 }

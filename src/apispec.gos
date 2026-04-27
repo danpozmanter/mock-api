@@ -65,7 +65,8 @@ pub fn bytes_to_string(b: &[u8]) -> String {
     let mut out: String = "".to_string()
     for byte in b.iter() {
         let c: char = (*byte) as char
-        out = out + c.to_string().as_str()
+        let cs: String = c.to_string()
+        out = out + cs
     }
     out
 }
@@ -73,12 +74,16 @@ pub fn bytes_to_string(b: &[u8]) -> String {
 /// Counts the registered routes — sum of `methods.len()` over
 /// every entry in `spec.paths`. Convenient for sanity-checking
 /// a parsed spec.
+///
+/// Uses the structural query API (`json::get`, `json::as_array`,
+/// `json::len`) instead of named-field access so the function
+/// works under both the interpreter and the native backend.
 pub fn route_count(spec: &json::Value) -> i64 {
+    let paths = json::as_array(&json::get(spec, "paths"))
     let mut total: i64 = 0
-    for entry in spec.paths.iter() {
-        for _m in entry.methods.iter() {
-            total = total + 1
-        }
+    for entry in paths.iter() {
+        let methods = json::get(entry, "methods")
+        total = total + json::len(&methods)
     }
     total
 }

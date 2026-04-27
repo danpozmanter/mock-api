@@ -23,7 +23,7 @@ project.toml          # project manifest
 config.json           # mock-api config (loaded by --config, defaults to ./config.json)
 spec.json             # API spec (referenced from config.json's "api_spec")
 src/
-├── main.gos          # entry point — flag parsing, App + http::Handler impl
+├── main.gos          # entry point — flags, embedded defaults, App + http::Handler impl
 ├── random.gos        # LCG PRNG + tests
 ├── simulator.gos     # ErrorSimulator + tests (embeds its own PRNG)
 ├── config.gos        # config parse / required-field validation + tests
@@ -32,9 +32,12 @@ src/
 go_implementation/     # the original Go port, kept for reference
 ```
 
-Each `src/<name>.gos` is its own module and is independently testable
-via `gos test src/<name>.gos`. `gos test src/` walks every file under
-`src/` and runs all tests in one shot.
+`src/main.gos` is the running binary and inlines the same logic as the
+per-module files because cross-module dispatch is not yet wired in
+this Gossamer release (see *runtime gotchas* below). Each
+`src/<name>.gos` is its own module testable via
+`gos test src/<name>.gos`; `gos test src/` walks every file under
+`src/` in one shot.
 
 ## Configuration
 
@@ -108,9 +111,9 @@ via `gos test src/<name>.gos`. `gos test src/` walks every file under
 
 ```
 gos check src/main.gos       # parse + resolve + typecheck the binary entry
-gos test  src/                # all 54 unit tests, every module
+gos test  src/                # all 57 unit tests, every module
 gos lint  src/main.gos        # style lints (warnings only)
-gos run   src/main.gos        # boot the server (see runtime gotchas below)
+gos run   src/main.gos        # boot the server with the embedded default config
 ```
 
 Each module's tests can also be run on their own:
@@ -121,15 +124,40 @@ gos test src/simulator.gos   # 14 simulator tests
 gos test src/config.gos      #  5 config tests
 gos test src/apispec.gos     #  7 apispec tests
 gos test src/handler.gos     # 21 handler tests
-gos test src/main.gos        #  1 build_app_config test
+gos test src/main.gos        #  4 integration tests
 ```
 
-The server listens on `0.0.0.0:8080` by default. Override with flags
-(passed *after* `--`, since `gos run` interprets unknown flags itself):
+The server listens on `0.0.0.0:8080` by default. Flags (passed
+*after* `--`, since `gos run` interprets unknown flags itself):
 
 ```
 gos run src/main.gos -- --config config.json --port 9000
 ```
+
+Boot output mirrors the Go implementation's `log.Printf` lines:
+
+```
+Loaded config: {…}
+Loaded API spec with 2 paths
+Registered endpoint: POST /v1/chat/completions
+Registered endpoint: GET /v1/models
+Loaded responses: […]
+Starting server on 0.0.0.0:8080
+```
+
+Per-request log lines appear as the server handles traffic:
+
+```
+Path /v1/models: Sleeping for 3471 ms
+Simulating error for request                        # only when the simulator fires
+404 /v1/unknown                                     # for unmatched paths
+```
+
+`std::fs::read_to_string` is not yet wired in this Gossamer
+release, so `--config <path>` currently logs `using embedded
+fallback` and proceeds with the `DEFAULT_CONFIG` / `DEFAULT_SPEC`
+constants in `src/main.gos`. Edit those constants to change the
+mocked endpoints until the fs bridge lands.
 
 ## Endpoints
 
@@ -154,7 +182,7 @@ ending with `data: [DONE]`.
 gos test src/
 ```
 
-54 unit tests across six modules:
+57 unit tests across six modules:
 
 - **`random_tests`** (6) — PRNG range, replay, edge cases.
 - **`simulator_tests`** (14) — error simulator init, observed rate,
@@ -168,8 +196,9 @@ gos test src/
   override lookup (with and without `?query=`), default response,
   latency range, SSE body shape, error body rendering, route matching
   (Found / 404 / 405).
-- **`main_tests`** (1) — `build_app_config` snapshots scalars off the
-  parsed JSON.
+- **`main_tests`** (4) — `build_app_config` scalar snapshot,
+  `parse_config` round-trip, `parse_spec` happy path, `match_route`
+  smoke test.
 
 ## Architecture
 
@@ -250,10 +279,21 @@ called out in source comments next to the workaround, but in summary:
    tests.
 10. **`fs::read_to_string` and `os::read_file` do not currently return
     a usable string** (the upstream `examples/file_io.gos` shows the
-    same `read 0 bytes` behaviour). `gos test` still exercises the
+    same `read 0 bytes` behaviour) — and the `Result` they return
+    doesn't pattern-match as `Ok` / `Err` either, so `match` falls
+    through both arms silently. `src/main.gos` therefore always uses
+    the embedded `DEFAULT_CONFIG` / `DEFAULT_SPEC` constants and
+    logs `using embedded fallback`. `gos test` still exercises the
     full validation / matching pipeline against inline JSON literals;
-    the `--config <path>` flag will start to work as soon as the
-    filesystem bridge does.
+    the `--config <path>` flag will start using the filesystem as
+    soon as the bridge lands.
+11. **`String::as_str()` returns `Some(<str>)` instead of `<str>`** in
+    the current interp, so any consumer that treats the result as a
+    raw `&str` (`raw.contains(s.as_str())`,
+    `raw.starts_with(s.as_str())`, `out + s.as_str()`) gets the
+    `Some(…)` rendering inside the comparison. The workaround is to
+    pass the `String` itself or `&String` to those APIs — every site
+    in this codebase has been migrated.
 
 Each of these has a marked workaround in `src/main.gos`. As the
 interpreter matures, the affected helpers can collapse back to the

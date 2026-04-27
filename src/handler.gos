@@ -33,7 +33,7 @@ pub fn path_matches(request_path: &String, route_path: &String) -> bool {
         return true
     }
     let with_query: String = route_path.clone() + "?"
-    request_path.starts_with(with_query.as_str())
+    request_path.starts_with(&with_query)
 }
 
 // ─── Latency / randomness ──────────────────────────────────────

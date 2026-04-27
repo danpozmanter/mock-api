@@ -42,19 +42,19 @@ pub fn has_string(obj: &json::Value, field: &str) -> bool {
     let raw = json::render(obj)
     let starts = format!("\"{field}\":\"")
     let empty = format!("\"{field}\":\"\"")
-    raw.contains(starts.as_str()) && !raw.contains(empty.as_str())
+    raw.contains(&starts) && !raw.contains(&empty)
 }
 
 /// Returns true when `obj.field` is an integer that is non-zero.
 pub fn has_positive_int(obj: &json::Value, field: &str) -> bool {
     let raw = json::render(obj)
     let needle = format!("\"{field}\":")
-    if !raw.contains(needle.as_str()) {
+    if !raw.contains(&needle) {
         return false
     }
     let zero_mid = format!("\"{field}\":0,")
     let zero_end = format!("\"{field}\":0}}")
-    !raw.contains(zero_mid.as_str()) && !raw.contains(zero_end.as_str())
+    !raw.contains(&zero_mid) && !raw.contains(&zero_end)
 }
 
 /// Returns true when `obj.field` is an integer (zero allowed).
@@ -66,12 +66,12 @@ pub fn has_int(obj: &json::Value, field: &str) -> bool {
 pub fn has_anything(obj: &json::Value, field: &str) -> bool {
     let raw = json::render(obj)
     let needle = format!("\"{field}\":")
-    if !raw.contains(needle.as_str()) {
+    if !raw.contains(&needle) {
         return false
     }
     let null_mid = format!("\"{field}\":null,")
     let null_end = format!("\"{field}\":null}}")
-    !raw.contains(null_mid.as_str()) && !raw.contains(null_end.as_str())
+    !raw.contains(&null_mid) && !raw.contains(&null_end)
 }
 
 /// Parses a JSON config blob and returns the root `Value` after
@@ -88,11 +88,13 @@ pub fn parse_config(text: &String) -> Result<json::Value, String> {
     let mut named: String = "".to_string()
     let mut count: i64 = 0
     for entry in missing.iter() {
-        if entry.len() > 0 {
+        let elen: i64 = entry.len() as i64
+        if elen > 0 {
+            let part: String = entry.to_string()
             if count == 0 {
-                named = entry.to_string()
+                named = part
             } else {
-                named = named + ", " + entry.as_str()
+                named = format!("{named}, {part}")
             }
             count = count + 1
         }
