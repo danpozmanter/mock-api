@@ -12,6 +12,19 @@ jobs:
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Clone or refresh Gossamer source
+        # Idempotent: if a previous run cached `gossamer/target` the
+        # `gossamer/` directory already exists at this point and a
+        # bare `git clone` would fail. We clone fresh only when the
+        # repo isn't already there; otherwise we fast-forward.
+        run: |
+          if [ ! -d gossamer/.git ]; then
+            git clone --depth=1 https://github.com/danpozmanter/gossamer.git
+          else
+            git -C gossamer fetch --depth=1 origin HEAD
+            git -C gossamer reset --hard FETCH_HEAD
+          fi
+
       - name: Cache cargo registry and gossamer build
         uses: actions/cache@v4
         with:
@@ -25,7 +38,6 @@ jobs:
 
       - name: Build and install Gossamer (gos)
         run: |
-          git clone --depth=1 https://github.com/danpozmanter/gossamer.git
           cd gossamer
           ./install.sh
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
