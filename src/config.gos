@@ -18,7 +18,7 @@ pub fn pick(missing: bool, name: &str) -> String {
 /// can iterate without `[T]::push`, which is unwired today.
 pub fn missing_config_fields(root: &json::Value) -> [String; 7] {
     let api_spec_missing = !has_string(root, "api_spec")
-    let low_missing: bool = !has_positive_int(&root.latency, "low_ms"
+    let low_missing: bool = !has_positive_int(&root.latency, "low_ms")
     let high_missing: bool = !has_positive_int(&root.latency, "high_ms")
     let freq_missing: bool = !has_int(&root.error_response, "frequency_per_10k")
     let code_missing: bool = !has_positive_int(&root.error_response, "code")
