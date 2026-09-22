@@ -88,14 +88,14 @@ impl App {
             println("Simulating error for request")
             return Reply::Json {
                 status: self.error_response.code
-                body: self.error_response.body.pretty
+                body: self.error_response.body.compact
             }
         }
         let data = response_data(route.path, self.responses)
         if is_streaming(query) {
             Reply::Stream { chunks: split_chunks(data.compact, STREAM_CHUNKS) }
         } else {
-            Reply::Json { status: 200, body: data.pretty }
+            Reply::Json { status: 200, body: data.line }
         }
     }
 }
@@ -182,7 +182,7 @@ pub fn split_chunks(text: String, count: i64) -> Vec<String> {
 
 /// `{"error": message}` as a JSON reply with `status`.
 pub fn json_error(status: i64, message: String) -> Reply {
-    Reply::Json { status: status, body: single_field("error", message).pretty }
+    Reply::Json { status: status, body: single_field("error", message).line }
 }
 
 // `{key: value}` for a `key` that needs no JSON escaping.

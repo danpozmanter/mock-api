@@ -4,9 +4,10 @@ use std::{errors, fs}
 /// Inclusive uniform-random response latency range, in milliseconds.
 pub struct Latency { pub low: f64, pub high: f64 }
 
-/// A JSON document in the two renderings the server writes: indented for a
-/// plain response, single-line for an SSE `data:` frame.
-pub struct JsonBody { pub pretty: String, pub compact: String }
+/// A JSON document in the two renderings the server writes, as the Go server
+/// writes them: newline-terminated for a response body (`json.Encoder`),
+/// bare for a simulated error and an SSE `data:` frame (`json.Marshal`).
+pub struct JsonBody { pub line: String, pub compact: String }
 
 /// Response returned when the error simulator fires, and how often it should.
 pub struct ErrorResponse { pub code: i64, pub body: JsonBody, pub frequency: f64 }
@@ -81,7 +82,8 @@ pub fn parse_config(text: String) -> Result<Config, errors::Error> {
 
 /// Renders `value` once in both forms a response needs.
 pub fn json_body(value: json::Value) -> JsonBody {
-    JsonBody { pretty: json::encode_pretty(value) + "\n", compact: json::render(value) }
+    let compact = json::render(value)
+    JsonBody { line: compact + "\n", compact: compact }
 }
 
 /// Normalized form of a route path: any trailing `/` removed.
@@ -212,7 +214,7 @@ mod tests {
         assert_eq(cfg.error_response.frequency, 0.05)
         assert_eq(cfg.prefix, "v1")
         assert_eq(cfg.error_response.body.compact, "{\"error\":\"simulated error\"}")
-        assert_eq(cfg.error_response.body.pretty, "{\n  \"error\": \"simulated error\"\n}\n")
+        assert_eq(cfg.error_response.body.line, "{\"error\":\"simulated error\"}\n")
         Ok(())
     }
 
