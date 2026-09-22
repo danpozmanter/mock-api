@@ -47,7 +47,7 @@ expect_status 405 DELETE /v1/models
 expect_status 404 GET /v1/unknown
 
 body=$(curl -s -m 10 "$base/v1/models")
-[[ $body == *'"id": "gpt-4"'* ]] || fail "override body missing from: $body"
+[[ $body == *'"id":"gpt-4"'* ]] || fail "override body missing from: $body"
 echo "ok: override body"
 
 stream=$(curl -s -N -m 10 "$base/v1/models?stream=true")

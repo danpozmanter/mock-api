@@ -24,7 +24,8 @@ pub fn load_api_spec(location: String) -> Result<ApiSpec, errors::Error> {
 
 /// Parses OpenAPI YAML (or JSON) into its routable paths.
 pub fn parse_api_spec(text: String) -> Result<ApiSpec, errors::Error> {
-    let root = yaml::parse(text).map_err(|e| errors::wrap(e, "error parsing API spec"))?
+    let json_text = yaml::to_json(text).map_err(|e| errors::wrap(e, "error parsing API spec"))?
+    let root = json::parse(json_text)?
     let Some(paths) = json::get(root, "paths") else {
         return Err(errors::new("error parsing API spec: missing `paths`"))
     }
