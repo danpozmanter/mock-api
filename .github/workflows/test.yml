@@ -1,52 +1,41 @@
+# Runs the checks, the test suite, and a smoke test of the release binary on
+# every push and pull request.
 name: Tests
 
 on: [push, pull_request]
+
+env:
+  # Keep in step with `gossamer-version` in project.toml and release.yml.
+  GOSSAMER_VERSION: v0.63.0
 
 jobs:
   test:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - name: Set up Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Clone or refresh Gossamer source
-        # Idempotent: if a previous run cached `gossamer/target` the
-        # `gossamer/` directory already exists at this point and a
-        # bare `git clone` would fail. We clone fresh only when the
-        # repo isn't already there; otherwise we fast-forward.
+      - name: Install the Gossamer toolchain (${{ env.GOSSAMER_VERSION }})
         run: |
-          if [ ! -d gossamer/.git ]; then
-            git clone --depth=1 https://github.com/danpozmanter/gossamer.git
-          else
-            git -C gossamer fetch --depth=1 origin HEAD
-            git -C gossamer reset --hard FETCH_HEAD
-          fi
-
-      - name: Cache cargo registry and gossamer build
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            gossamer/target
-          key: ${{ runner.os }}-gossamer-${{ hashFiles('gossamer/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-gossamer-
-
-      - name: Build and install Gossamer (gos)
-        run: |
-          cd gossamer
-          ./install.sh
+          curl -fsSL https://raw.githubusercontent.com/gossamer-lang/gossamer/main/scripts/install.sh | sh
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Show toolchain
+        run: gos --version
+
+      - name: gos fmt
+        run: gos fmt --check
 
       - name: gos check
         run: gos check src/main.gos
 
       - name: gos test
-        run: gos test src/
+        run: gos test
 
       - name: gos lint
-        run: gos lint src/main.gos
+        run: gos lint
+
+      - name: gos build --release
+        run: gos build --release --out-dir dist
+
+      - name: Smoke test the native binary
+        run: scripts/smoke.sh dist/mock-api

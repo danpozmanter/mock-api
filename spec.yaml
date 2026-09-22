@@ -1,0 +1,20 @@
+# A minimal OpenAPI document. Only `paths` and each path's operation keys
+# (get, put, post, delete, options, head, patch, trace) are read.
+openapi: 3.0.0
+info:
+  title: Mock API
+  version: 1.0.0
+paths:
+  /chat/completions:
+    post:
+      summary: Create a chat completion
+  /models:
+    get:
+      summary: List models
+  /models/{model}:
+    parameters:
+      - name: model
+        in: path
+        required: true
+    get:
+      summary: Retrieve a model

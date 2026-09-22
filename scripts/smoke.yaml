@@ -1,0 +1,18 @@
+# Config for scripts/smoke.sh: short latency and no simulated errors, so every
+# answer is deterministic apart from its timing.
+api_spec: "spec.yaml"
+latency:
+  low: 1
+  high: 20
+prefix: "v1"
+responses:
+  "/v1/models":
+    object: "list"
+    data:
+      - id: "gpt-4"
+        object: "model"
+error_response:
+  code: 500
+  body:
+    error: "simulated error occurred"
+  frequency: 0

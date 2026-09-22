@@ -1,5 +1,6 @@
-# URL or file path to your API spec YAML.
-api_spec: "https://raw.githubusercontent.com/openai/openai-openapi/master/openapi.yaml"
+# URL or file path to your API spec (OpenAPI YAML or JSON), for example
+# "https://raw.githubusercontent.com/openai/openai-openapi/master/openapi.yaml".
+api_spec: "spec.yaml"
 
 latency:
   low: 50           # Low latency in ms.
@@ -9,7 +10,7 @@ prefix: "v1"
 
 responses:
   # Direct JSON string override
-  "/v1/chat/completions":  |
+  "/v1/chat/completions": |
     {
       "id": "chatcmpl-123",
       "object": "chat.completion",
@@ -30,7 +31,7 @@ responses:
         }
       ]
     }
-  
+
   # Structure override (will be converted to JSON)
   "/v1/models":
     object: "list"

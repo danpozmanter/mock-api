@@ -1,27 +1,33 @@
-# Makefile for building, running, and testing the project
+# Build, run, and verify mock-api with the Gossamer toolchain (gos).
 
-BINARY=mock-api
+BINARY := target/release/mock-api
+CONFIG ?= config.yaml
+PORT ?= 8080
 
-.PHONY: all build run test clean
+.PHONY: all build run test check fmt lint smoke clean
 
 all: build
 
 build:
-	go build -o $(BINARY) .
+	gos build --release
 
-run: build
-	./$(BINARY)
+run:
+	gos run src/main.gos --config $(CONFIG) --port $(PORT)
 
 test:
-	go test ./... -cover
+	gos test
 
-testreport:
-	go test ./... -coverprofile=coverage.out
-	go tool cover -func=coverage.out
-	rm -fv coverage.out
+check:
+	gos check src/main.gos
 
-clean:
-	rm -f $(BINARY)
+fmt:
+	gos fmt --check
 
 lint:
-	golangci-lint run
+	gos lint
+
+smoke: build
+	scripts/smoke.sh $(BINARY)
+
+clean:
+	rm -rf target dist .gos-cache

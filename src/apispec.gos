@@ -1,175 +1,131 @@
-/// API-spec loading + parsing. The spec is a JSON document
-/// shaped like:
-///
-/// ```json
-/// { "paths": [ { "path": "/foo", "methods": ["GET", "POST"] }, ... ] }
-/// ```
-///
-/// The spec lives either on disk (file path) or behind an
-/// `http(s)://` URL. Errors surface as plain `String` for the
-/// same reason as in `config` — `errors::Error::message` is
-/// not yet bridged into the interp.
+use std::encoding::{json, yaml}
+use std::{errors, fs, http}
 
-use std::encoding::json
-use std::fs
-use std::http
+// The operation keys an OpenAPI path item may carry; every other key
+// (`summary`, `parameters`, `servers`, ...) describes the path, not a method.
+const OPERATIONS: [String; 8] = ["get", "put", "post", "delete", "options", "head", "patch", "trace"]
 
-/// Loads an API spec — either from a local file or an
-/// `http(s)://` URL. The filesystem and HTTP-client bridges
-/// behind this are partially wired in the current Gossamer
-/// release; callers exercising the load behaviour at unit-test
-/// time should drive `parse_spec` directly with an inline
-/// string.
-pub fn load_api_spec(spec_url: &String) -> Result<json::Value, String> {
-    let text: String = if spec_url.starts_with("http://") || spec_url.starts_with("https://") {
-        let client = http::Client::new()
-        let resp_r = client.get(spec_url).send()
-        let resp = match resp_r {
-            Ok(r) => r,
-            Err(_) => return Err(format!("fetching API spec from URL {spec_url}")),
-        }
-        bytes_to_string(&resp.body)
+/// One spec path and the HTTP methods (upper case) it declares.
+pub struct PathItem { pub path: String, pub methods: Vec<String> }
+
+/// The routable part of an OpenAPI document: its paths, sorted.
+pub struct ApiSpec { pub paths: Vec<PathItem> }
+
+/// Loads the spec from an `http(s)://` URL or a file path.
+pub fn load_api_spec(location: String) -> Result<ApiSpec, errors::Error> {
+    let text = if location.starts_with("http://") || location.starts_with("https://") {
+        fetch(location)?
     } else {
-        let read = fs::read_to_string(spec_url)
-        match read {
-            Ok(s) => s,
-            Err(_) => return Err(format!("reading API spec file {spec_url}")),
-        }
+        fs::read_to_string(location)
+            .map_err(|e| errors::wrap(e, format("error reading API spec file {}", location)))?
     }
-    parse_spec(&text)
+    parse_api_spec(text)
 }
 
-/// Parses an API spec JSON blob and returns the root `Value`.
-/// Validates that the top-level `paths` field is present.
-pub fn parse_spec(text: &String) -> Result<json::Value, String> {
-    let parsed = json::parse(text)
-    let root = match parsed {
-        Ok(v) => v,
-        Err(_) => return Err("parsing API spec: invalid JSON".to_string()),
+/// Parses OpenAPI YAML (or JSON) into its routable paths.
+pub fn parse_api_spec(text: String) -> Result<ApiSpec, errors::Error> {
+    let json_text = yaml::to_json(text).map_err(|e| errors::wrap(e, "error parsing API spec"))?
+    let root = json::parse(json_text)?
+    let Some(paths) = json::get(root, "paths") else {
+        return Err(errors::new("error parsing API spec: missing `paths`"))
     }
-    let rendered = json::render(&root)
-    if !rendered.contains("\"paths\":") {
-        return Err("API spec is missing required `paths` field".to_string())
+    let Some(keys) = json::keys(paths) else {
+        return Err(errors::new("error parsing API spec: `paths` must be a mapping"))
     }
-    Ok(root)
+    let mut items = #[]
+    for path in keys {
+        let declared = json::get(paths, path).and_then(json::keys).unwrap_or(#[])
+        let methods = OPERATIONS
+            .to_vec()
+            .filter(|op| declared.contains(op))
+            .map(|op| op.to_uppercase())
+        items.push(PathItem { path: path, methods: methods })
+    }
+    items.sort_by_key(|p| p.path)
+    Ok(ApiSpec { paths: items })
 }
 
-/// Renders a `[u8]` body as a string. The interpreter's
-/// `byte as char` cast currently keeps the numeric form, so
-/// the result is a concatenation of decimal byte values rather
-/// than the original UTF-8 text. Once the cast becomes a real
-/// value conversion, this collapses back to the obvious
-/// implementation. Used only by `load_api_spec` for the HTTP
-/// branch — the unit tests drive `parse_spec` with inline text.
-pub fn bytes_to_string(b: &[u8]) -> String {
-    let mut out: String = "".to_string()
-    for byte in b.iter() {
-        let c: char = (*byte) as char
-        let cs: String = c.to_string()
-        out = out + cs
+fn fetch(url: String) -> Result<String, errors::Error> {
+    let resp = http::get(url, #[])
+        .map_err(|e| errors::wrap(e, format("error fetching API spec from URL {}", url)))?
+    if resp.status < 200 || resp.status > 299 {
+        return Err(errors::new(format("error fetching API spec from URL {}: status {}", url, resp.status)))
     }
-    out
-}
-
-/// Counts the registered routes — sum of `methods.len()` over
-/// every entry in `spec.paths`. Convenient for sanity-checking
-/// a parsed spec.
-///
-/// Uses the structural query API (`json::get`, `json::as_array`,
-/// `json::len`) instead of named-field access so the function
-/// works under both the interpreter and the native backend.
-pub fn route_count(spec: &json::Value) -> i64 {
-    let paths = json::as_array(&json::get(spec, "paths"))
-    let mut total: i64 = 0
-    for entry in paths.iter() {
-        let methods = json::get(entry, "methods")
-        total = total + json::len(&methods)
-    }
-    total
+    Ok(resp.body)
 }
 
 #[cfg(test)]
-mod apispec_tests {
-    use std::testing
+mod tests {
+    use std::{errors, fs}
 
-    const VALID_SPEC: &str = r#"{
-"paths":[
-    {"path":"/chat/completions","methods":["POST"]},
-    {"path":"/models","methods":["GET","HEAD"]}
-]
-}"#
+    use super::{load_api_spec, parse_api_spec}
 
     #[test]
-    fn parse_spec_accepts_well_formed() {
-        let s = super::VALID_SPEC.to_string()
-        let r = super::parse_spec(&s)
-        match r {
-            Ok(v) => {
-                let count = super::route_count(&v)
-                testing::check_eq(&count, &3, "two paths, three routes")
-            }
-            Err(msg) => panic!("expected ok, got err: {}", msg),
+    fn parses_paths_and_methods() -> Result<(), errors::Error> {
+        let spec = parse_api_spec("""
+        paths:
+          /test:
+            get: {}
+          /models/{model}:
+            parameters: []
+            summary: one model
+            get: {}
+            delete: {}
+        """)?
+        assert_eq(spec.paths.len(), 2)
+        assert_eq(spec.paths[0].path, "/models/{model}")
+        assert_eq(spec.paths[0].methods, #["GET", "DELETE"])
+        assert_eq(spec.paths[1].path, "/test")
+        assert_eq(spec.paths[1].methods, #["GET"])
+        Ok(())
+    }
+
+    #[test]
+    fn accepts_json_specs() -> Result<(), errors::Error> {
+        let spec = parse_api_spec("{\"paths\": {\"/x\": {\"post\": {}}}}")?
+        assert_eq(spec.paths[0].methods, #["POST"])
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_a_spec_without_paths() {
+        match parse_api_spec("openapi: 3.0.0") {
+            Ok(_) => panic("expected an error")
+            Err(e) => assert(e.to_string().contains("missing `paths`"), e.to_string())
         }
     }
 
     #[test]
-    fn parse_spec_rejects_invalid_json() {
-        let bad = "not: valid: json:".to_string()
-        let r = super::parse_spec(&bad)
-        match r {
-            Ok(_) => panic!("expected err"),
-            Err(msg) => testing::check(msg.contains("parsing API spec"), "wraps parse error"),
+    fn rejects_invalid_yaml() {
+        match parse_api_spec("invalid: yaml: -") {
+            Ok(_) => panic("expected an error")
+            Err(e) => assert(e.to_string().contains("error parsing API spec"), e.to_string())
         }
     }
 
     #[test]
-    fn parse_spec_rejects_missing_paths_field() {
-        let bad = r#"{"version":"1.0"}"#.to_string()
-        let r = super::parse_spec(&bad)
-        match r {
-            Ok(_) => panic!("expected err"),
-            Err(msg) => testing::check(msg.contains("paths"), "names paths"),
+    fn load_api_spec_reads_a_file() -> Result<(), errors::Error> {
+        let dir = fs::temp_dir("mock-api-spec")?
+        defer fs::remove_dir_all(dir)
+        let path = format("{}/spec.yaml", dir)
+        fs::write(path, "paths:\n  /test:\n    get: {}\n".as_bytes())?
+        assert_eq(load_api_spec(path)?.paths.len(), 1)
+        Ok(())
+    }
+
+    #[test]
+    fn load_api_spec_reports_a_missing_file() {
+        match load_api_spec("non_existent_file.yaml") {
+            Ok(_) => panic("expected an error")
+            Err(e) => assert(e.to_string().contains("error reading API spec file"), e.to_string())
         }
     }
 
     #[test]
-    fn route_count_handles_empty_paths() {
-        let s = r#"{"paths":[]}"#.to_string()
-        let r = super::parse_spec(&s)
-        match r {
-            Ok(v) => testing::check_eq(&super::route_count(&v), &0, "empty"),
-            Err(msg) => panic!("expected ok, got err: {}", msg),
+    fn load_api_spec_reports_an_unreachable_url() {
+        match load_api_spec("http://127.0.0.1:1/spec.yaml") {
+            Ok(_) => panic("expected an error")
+            Err(e) => assert(e.to_string().contains("error fetching API spec from URL"), e.to_string())
         }
-    }
-
-    #[test]
-    fn route_count_sums_methods() {
-        let s = r#"{"paths":[
-{"path":"/a","methods":["GET","POST","PUT","DELETE"]},
-{"path":"/b","methods":["GET"]}
-]}"#.to_string()
-        let r = super::parse_spec(&s)
-        match r {
-            Ok(v) => testing::check_eq(&super::route_count(&v), &5, "4 + 1"),
-            Err(msg) => panic!("expected ok, got err: {}", msg),
-        }
-    }
-
-    #[test]
-    fn bytes_to_string_returns_non_empty_for_non_empty_input() {
-        // The interp's `byte as char` cast doesn't yet convert
-        // values, so this only checks the function emits *some*
-        // string per byte. When the cast lands the assertion
-        // can tighten to exact UTF-8 round-tripping.
-        let bytes: [u8] = [104, 105]
-        let s = super::bytes_to_string(&bytes)
-        testing::check(s.len() > 0, "non-empty output")
-    }
-
-    #[test]
-    fn bytes_to_string_empty_input_is_empty() {
-        let bytes: [u8] = []
-        let s = super::bytes_to_string(&bytes)
-        testing::check_eq(&s.len(), &0, "empty in, empty out")
     }
 }

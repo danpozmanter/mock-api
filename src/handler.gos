@@ -1,397 +1,403 @@
-/// HTTP request handling. Pure functions for path matching,
-/// override lookup, latency selection, and SSE body shaping.
-/// The actual `App` / `http::Handler` impl lives in
-/// `src/main.gos` so this module stays self-testing.
-///
-/// Embeds its own minimal LCG PRNG state for `get_latency_ms`
-/// — cross-module method dispatch is currently broken in the
-/// Gossamer interpreter, so every module that needs randomness
-/// keeps a local copy. See `src/random/mod.gos` for the
-/// canonical implementation.
-
 use std::encoding::json
-use std::http
+use std::http::router
+use std::{errors, http, time}
 
-// ─── Path helpers ──────────────────────────────────────────────
+use apispec::ApiSpec
+use config::{json_body, normalize_path, Config, ErrorResponse, JsonBody}
+use random::Random
+use simulator::ErrorSimulator
 
-/// Builds the canonical full path: `"/" + prefix + path`. The
-/// caller is responsible for ensuring `prefix` has no slashes
-/// and `path` either starts with `/` or is bare.
-pub fn build_full_path(prefix: &String, path: &String) -> String {
-    if path.starts_with("/") {
-        format!("/{prefix}{path}")
-    } else {
-        format!("/{prefix}/{path}")
-    }
+const STREAM_CHUNKS: i64 = 3
+
+// One registered (method, path) pair. Routes for the same path share one
+// simulator, so every method on a path counts toward the same error rate.
+struct Route { method: String, path: String, simulator: ErrorSimulator }
+
+/// Routing table plus the state every request reads.
+pub struct App {
+    responses: Map<String, JsonBody>
+    error_response: ErrorResponse
+    table: router::Router
+    routes: Vec<Route>
+    methods: Vec<String>
+    pacer: Pacer
 }
 
-/// Returns true when `request_path` matches `route_path`
-/// exactly or matches `route_path + "?..."` (the request also
-/// carries a query string).
-pub fn path_matches(request_path: &String, route_path: &String) -> bool {
-    if *request_path == *route_path {
-        return true
-    }
-    let with_query: String = route_path.clone() + "?"
-    request_path.starts_with(&with_query)
+/// Source of simulated latency. It holds only scalars and a shared generator,
+/// so a stream-writer goroutine can carry it where it cannot carry an `App`.
+pub struct Pacer { low: f64, high: f64, rng: Random }
+
+/// What a request resolves to: a complete JSON body, or SSE chunks for `feed`.
+pub enum Reply {
+    Json { status: i64, body: String }
+    Stream { chunks: Vec<String> }
 }
 
-// ─── Latency / randomness ──────────────────────────────────────
-
-/// Advances an LCG state and returns the new state plus a
-/// non-negative value. Embedded so the handler stays
-/// self-sufficient under cross-module dispatch failures.
-pub fn step_rng(state: i64) -> (i64, i64) {
-    let new_state: i64 = state * 6_364_136_223_846_793_005 + 1_442_695_040_888_963_407
-    let positive: i64 = if new_state < 0 { -new_state } else { new_state }
-    let pair: (i64, i64) = (new_state, positive)
-    pair
-}
-
-/// Picks a uniform-random latency in `[low_ms, high_ms]`.
-/// Returns `(next_state, latency_ms)` so the caller can thread
-/// the PRNG state across requests.
-pub fn get_latency_ms(low_ms: i64, high_ms: i64, state: i64) -> (i64, i64) {
-    if high_ms <= low_ms {
-        let pair: (i64, i64) = (state, low_ms)
-        return pair
-    }
-    let stepped = step_rng(state)
-    let span: i64 = high_ms - low_ms + 1
-    let pair: (i64, i64) = (stepped.0, low_ms + (stepped.1 % span))
-    pair
-}
-
-// ─── Override / response body ──────────────────────────────────
-
-/// Returns the override response body for `request_path`, or
-/// `None` when no override is registered. `request_path` may
-/// carry a `?query=` suffix.
-pub fn lookup_override(responses: &json::Value, request_path: &String) -> Option<json::Value> {
-    for entry in responses.iter() {
-        let entry_path: String = entry.path
-        if path_matches(request_path, &entry_path) {
-            let body: json::Value = entry.body
-            return Some(body)
-        }
-    }
-    None
-}
-
-/// Builds the JSON body for a request: the override if one
-/// matches, otherwise a default `{"message":"Response for
-/// <path>"}` shape.
-pub fn response_body_for(request_path: &String, responses: &json::Value) -> String {
-    match lookup_override(responses, request_path) {
-        Some(v) => json::render(&v),
-        None => format!("{{\"message\":\"Response for {request_path}\"}}"),
-    }
-}
-
-// ─── SSE / response shaping ────────────────────────────────────
-
-/// Builds an SSE-formatted body wrapping `payload` as a single
-/// `data:` chunk and ending with `data: [DONE]`. The Go
-/// original streamed via `http.Flusher`; Gossamer's `std::http`
-/// returns a single buffered response, so the body is one shot
-/// but preserves the same wire format the original tests
-/// asserted against.
-pub fn build_sse_body(payload: &String) -> String {
-    format!("data: {payload}\n\ndata: [DONE]\n\n")
-}
-
-/// Returns true when the request asked for SSE streaming via
-/// `?stream=true`.
-pub fn is_streaming_path(path: &String) -> bool {
-    path.contains("stream=true")
-}
-
-/// Renders a JSON error body of the shape `{"error":"<msg>"}`.
-pub fn error_body(msg: &str) -> String {
-    format!("{{\"error\":\"{msg}\"}}")
-}
-
-/// Builds an `application/json` response from a status code and
-/// body string.
-pub fn json_response(status: i64, body: String) -> http::Response {
-    http::Response::json(status as u16, body.into_bytes())
-}
-
-/// Builds a `text/event-stream` response by overwriting the
-/// `Content-Type` header on a text response.
-pub fn sse_response(status: i64, body: String) -> http::Response {
-    let mut r = http::Response::text(status as u16, body)
-    r.headers.insert("content-type", "text/event-stream")
-    r
-}
-
-// ─── Routing ───────────────────────────────────────────────────
-
-/// Result of matching a request against the registered spec
-/// routes.
-pub enum RouteMatch { NotFound, MethodNotAllowed, Found }
-
-/// Matches `request_path` + `method_name` (uppercase, e.g.
-/// `"GET"`) against the registered spec routes. The method is
-/// passed by name so this stays bridge-independent — the
-/// runtime's `match` over `http::Method` variants is not yet
-/// wired in this Gossamer release.
-pub fn match_route(
-    spec_paths: &json::Value,
-    prefix: &String,
-    request_path: &String,
-    method_name: &String,
-) -> RouteMatch {
-    let mut path_seen: bool = false
-    for entry in spec_paths.iter() {
-        let suffix: String = entry.path
-        let full: String = build_full_path(prefix, &suffix)
-        if path_matches(request_path, &full) {
-            path_seen = true
-            for m in entry.methods.iter() {
-                let allowed: String = (*m).to_uppercase()
-                if allowed == *method_name {
-                    return RouteMatch::Found
+impl App {
+    /// Registers a route per (path, method) the spec declares, under the config's prefix.
+    pub fn new(config: Config, spec: ApiSpec, rng: Random) -> Result<App, errors::Error> {
+        let table = router::Router::new()
+        let mut routes = #[]
+        let mut methods = #[]
+        for item in spec.paths {
+            let full = build_full_path(config.prefix, item.path)
+            let simulator = ErrorSimulator::new(config.error_response.frequency, rng)
+            for method in item.methods {
+                if let Err(e) = router::add(table, method, full) {
+                    return Err(errors::new(format("registering {} {}: {}", method, full, e)))
+                }
+                routes.push(Route { method: method, path: full, simulator: simulator })
+                if !methods.contains(method) {
+                    methods.push(method)
                 }
             }
         }
+        let pacer = Pacer { low: config.latency.low, high: config.latency.high, rng: rng }
+        Ok(App {
+            responses: config.responses
+            error_response: config.error_response
+            table: table
+            routes: routes
+            methods: methods
+            pacer: pacer
+        })
     }
-    if path_seen { RouteMatch::MethodNotAllowed } else { RouteMatch::NotFound }
+
+    /// Registered (method, path) pairs, in registration order.
+    pub fn endpoints(&self) -> Vec<(String, String)> {
+        self.routes.map(|r| (r.method, r.path))
+    }
+
+    /// Sleeps the simulated latency, then answers the override, default, or
+    /// simulated error for a request; unknown paths and methods answer at once.
+    pub fn respond(&self, method: String, path: String, query: Vec<(String, String)>) -> Reply {
+        let Some(index) = router::lookup(self.table, method, path) else {
+            if self.methods.iter().any(|m| router::lookup(self.table, m, path).is_some()) {
+                println("405 {} {}", method, path)
+                return json_error(405, "Method not allowed")
+            }
+            println("404 {} {}", method, path)
+            return json_error(404, "Not found")
+        }
+        let route = self.routes[index]
+        let latency = self.pacer.delay_ms()
+        println("Path {}: Sleeping for {:.2} ms", route.path, latency)
+        time::sleep(latency as i64)
+
+        if route.simulator.should_error() {
+            println("Simulating error for request")
+            return Reply::Json {
+                status: self.error_response.code
+                body: self.error_response.body.pretty
+            }
+        }
+        let data = response_data(route.path, self.responses)
+        if is_streaming(query) {
+            Reply::Stream { chunks: split_chunks(data.compact, STREAM_CHUNKS) }
+        } else {
+            Reply::Json { status: 200, body: data.pretty }
+        }
+    }
+}
+
+impl Pacer {
+    /// Uniform-random latency in the configured range, in milliseconds.
+    pub fn delay_ms(&self) -> f64 {
+        self.rng.between(self.low, self.high)
+    }
+
+    /// Writes each chunk as an SSE `data:` frame with a simulated latency after
+    /// it, then the `[DONE]` marker; stops early once the client disconnects.
+    pub fn feed(&self, body: http::ResponseStream, chunks: Vec<String>) {
+        defer body.close()
+        for chunk in chunks {
+            if body.write(format("data: {}\n\n", chunk)) < 0 {
+                return
+            }
+            time::sleep(self.delay_ms() as i64)
+        }
+        let _ = body.write("data: [DONE]\n\n")
+    }
+}
+
+/// Serves `app` on a listening `server` until it shuts down. The server's
+/// cohort owns every stream writer, so a writer keeps going after its handler
+/// has returned the response head, and none outlives the server.
+pub fn serve(app: App, server: http::Server) -> Result<(), errors::Error> {
+    let pacer = app.pacer
+    cohort {
+        server.serve(|r| {
+            match app.respond(r.method, r.path, r.query_pairs) {
+                Reply::Json { status, body } => Ok(http::Response::json(status, body))
+                Reply::Stream { chunks } => {
+                    let body = http::ResponseStream::new()
+                    spawn(|| pacer.feed(body, chunks))
+                    Ok(http::Response::stream(200, "text/event-stream", body))
+                }
+            }
+        })?
+    }
+}
+
+/// Route path for a spec path under `prefix`, with exactly one `/` between them.
+pub fn build_full_path(prefix: String, path: String) -> String {
+    format("/{}/{}", prefix.trim_matches('/'), path.trim_start_matches('/'))
+}
+
+/// Override body configured for `path`, else `{"message": "Response for <path>"}`.
+pub fn response_data(path: String, responses: Map<String, JsonBody>) -> JsonBody {
+    let normalized = normalize_path(path)
+    if let Some(body) = responses.get(normalized) {
+        return body
+    }
+    single_field("message", format("Response for {}", normalized))
+}
+
+/// Whether the query asks for an SSE stream (`stream=true`, first value wins).
+pub fn is_streaming(query: Vec<(String, String)>) -> bool {
+    query.iter().find(|(k, _)| k == "stream").map(|(_, v)| v == "true").unwrap_or(false)
+}
+
+/// `text` split into `count` roughly equal pieces on character boundaries,
+/// plus one shorter trailing piece when the length does not divide evenly.
+pub fn split_chunks(text: String, count: i64) -> Vec<String> {
+    let size = max(text.len() / count, 1)
+    let mut chunks = #[]
+    let mut current = String::with_capacity(size)
+    let mut filled = 0
+    for c in text {
+        current.push(c)
+        filled += 1
+        if filled == size {
+            chunks.push(current)
+            current = String::with_capacity(size)
+            filled = 0
+        }
+    }
+    if filled > 0 {
+        chunks.push(current)
+    }
+    chunks
+}
+
+/// `{"error": message}` as a JSON reply with `status`.
+pub fn json_error(status: i64, message: String) -> Reply {
+    Reply::Json { status: status, body: single_field("error", message).pretty }
+}
+
+// `{key: value}` for a `key` that needs no JSON escaping.
+fn single_field(key: String, value: String) -> JsonBody {
+    let text = format("{{\"{}\":{}}}", key, json::encode(value))
+    // SAFETY: `json::encode` of a String answers a quoted JSON string literal,
+    // so `text` is a well-formed object.
+    json_body(json::parse(text).unwrap())
 }
 
 #[cfg(test)]
-mod handler_tests {
+mod tests {
     use std::encoding::json
-    use std::http
-    use std::testing
+    use std::{errors, http, time}
 
-    fn parse(s: &str) -> json::Value {
-        match json::parse(&s.to_string()) {
-            Ok(v) => v,
-            Err(_) => panic!("bad fixture json"),
+    use apispec::parse_api_spec
+    use config::parse_config
+    use random::Random
+
+    use super::{build_full_path, is_streaming, response_data, serve, split_chunks, App, Reply}
+
+    fn app_with(frequency: f64) -> Result<App, errors::Error> {
+        let cfg = parse_config(format("""
+        api_spec: spec.yaml
+        latency: {{ low: 10, high: 20 }}
+        prefix: v1
+        responses:
+          /v1/test: '{{"custom":"data","value":123}}'
+          /v1/struct:
+            status: success
+            code: 200
+        error_response:
+          code: 500
+          body: {{ error: simulated error }}
+          frequency: {}
+        """, frequency))?
+        let spec = parse_api_spec("""
+        paths:
+          /test: { get: {} }
+          /struct: { get: {}, post: {} }
+          /other: { get: {} }
+          /models/{model}: { get: {} }
+        """)?
+        App::new(cfg, spec, Random::seeded(17))
+    }
+
+    fn json_reply(reply: Reply) -> (i64, json::Value) {
+        match reply {
+            Reply::Json { status, body } => (status, json::parse(body).unwrap())
+            Reply::Stream { .. } => panic("expected a JSON reply")
         }
     }
 
-    #[test]
-    fn build_full_path_with_leading_slash() {
-        testing::check_eq(
-            &super::build_full_path(&"v1".to_string(), &"/foo".to_string()),
-            &"/v1/foo".to_string(),
-            "leading slash",
-        )
+    fn field(v: json::Value, key: String) -> String {
+        json::render(json::get(v, key).unwrap())
     }
 
     #[test]
-    fn build_full_path_without_leading_slash() {
-        testing::check_eq(
-            &super::build_full_path(&"v1".to_string(), &"foo".to_string()),
-            &"/v1/foo".to_string(),
-            "no leading slash",
-        )
+    fn string_override_is_returned() -> Result<(), errors::Error> {
+        let app = app_with(0.0)?
+        let status, body = json_reply(app.respond("GET", "/v1/test", #[("stream", "false")]))
+        assert_eq(status, 200)
+        assert_eq(field(body, "custom"), "\"data\"")
+        assert_eq(field(body, "value"), "123")
+        Ok(())
     }
 
     #[test]
-    fn path_matches_exact() {
-        testing::check(
-            super::path_matches(&"/v1/test".to_string(), &"/v1/test".to_string()),
-            "exact",
-        )
+    fn structured_override_is_returned() -> Result<(), errors::Error> {
+        let app = app_with(0.0)?
+        let status, body = json_reply(app.respond("POST", "/v1/struct", #[]))
+        assert_eq(status, 200)
+        assert_eq(field(body, "status"), "\"success\"")
+        assert_eq(field(body, "code"), "200")
+        Ok(())
     }
 
     #[test]
-    fn path_matches_with_query() {
-        testing::check(
-            super::path_matches(&"/v1/test?stream=true".to_string(), &"/v1/test".to_string()),
-            "with query",
-        )
+    fn route_without_override_answers_default_message() -> Result<(), errors::Error> {
+        let app = app_with(0.0)?
+        let status, body = json_reply(app.respond("GET", "/v1/other", #[]))
+        assert_eq(status, 200)
+        assert_eq(field(body, "message"), "\"Response for /v1/other\"")
+        Ok(())
     }
 
     #[test]
-    fn path_matches_misses_other_path() {
-        testing::check(
-            !super::path_matches(&"/v1/other".to_string(), &"/v1/test".to_string()),
-            "miss",
-        )
+    fn templated_path_matches_and_names_its_template() -> Result<(), errors::Error> {
+        let app = app_with(0.0)?
+        let status, body = json_reply(app.respond("GET", "/v1/models/gpt-4", #[]))
+        assert_eq(status, 200)
+        assert_eq(field(body, "message"), "\"Response for /v1/models/{model}\"")
+        Ok(())
     }
 
     #[test]
-    fn path_matches_does_not_match_extension() {
-        testing::check(
-            !super::path_matches(&"/v1/testing".to_string(), &"/v1/test".to_string()),
-            "extension is not a match",
-        )
+    fn trailing_slash_matches_the_route() -> Result<(), errors::Error> {
+        let app = app_with(0.0)?
+        let status, _ = json_reply(app.respond("GET", "/v1/test/", #[]))
+        assert_eq(status, 200)
+        Ok(())
     }
 
     #[test]
-    fn lookup_override_finds_match() {
-        let resp = parse("[{\"path\":\"/v1/test\",\"body\":{\"custom\":\"data\"}}]")
-        let got = super::lookup_override(&resp, &"/v1/test".to_string())
-        match got {
-            Some(v) => testing::check(json::render(&v).contains("custom"), "renders body"),
-            None => panic!("expected match"),
+    fn simulated_error_returns_configured_response() -> Result<(), errors::Error> {
+        let app = app_with(1.0)?
+        let status, body = json_reply(app.respond("GET", "/v1/test", #[]))
+        assert_eq(status, 500)
+        assert_eq(field(body, "error"), "\"simulated error\"")
+        Ok(())
+    }
+
+    #[test]
+    fn unknown_path_is_not_found() -> Result<(), errors::Error> {
+        let app = app_with(0.0)?
+        let status, body = json_reply(app.respond("GET", "/v1/unknown", #[]))
+        assert_eq(status, 404)
+        assert_eq(field(body, "error"), "\"Not found\"")
+        Ok(())
+    }
+
+    #[test]
+    fn undeclared_method_is_not_allowed() -> Result<(), errors::Error> {
+        let app = app_with(0.0)?
+        let status, body = json_reply(app.respond("DELETE", "/v1/test", #[]))
+        assert_eq(status, 405)
+        assert_eq(field(body, "error"), "\"Method not allowed\"")
+        Ok(())
+    }
+
+    #[test]
+    fn endpoints_list_every_route() -> Result<(), errors::Error> {
+        let app = app_with(0.0)?
+        assert_eq(app.endpoints(), #[
+            ("GET", "/v1/models/{model}")
+            ("GET", "/v1/other")
+            ("GET", "/v1/struct")
+            ("POST", "/v1/struct")
+            ("GET", "/v1/test")
+        ])
+        Ok(())
+    }
+
+    #[test]
+    fn stream_request_chunks_the_body() -> Result<(), errors::Error> {
+        let app = app_with(0.0)?
+        let Reply::Stream { chunks } = app.respond("GET", "/v1/test", #[("stream", "true")]) else {
+            panic("expected a stream reply")
         }
+        assert_eq(chunks.join(""), "{\"custom\":\"data\",\"value\":123}")
+        Ok(())
     }
 
     #[test]
-    fn lookup_override_misses_unknown() {
-        let resp = parse("[{\"path\":\"/v1/test\",\"body\":\"x\"}]")
-        let got = super::lookup_override(&resp, &"/v1/other".to_string())
-        match got {
-            Some(_) => panic!("expected none"),
-            None => testing::check(true, "miss"),
-        }
+    fn server_answers_json_errors_and_sse_streams() -> Result<(), errors::Error> {
+        let app = app_with(0.0)?
+        let server = http::Server::new()
+        server.listen("127.0.0.1:0")?
+        let base = format("http://{}", server.addr())
+        let mut statuses = #[]
+        let mut frames = #[]
+        let mut elapsed = #[]
+        cohort {
+            spawn(|| {
+                defer server.shutdown(2000)
+                for path in ["/v1/unknown", "/v1/test"] {
+                    if let Ok(resp) = http::get(base + path, #[]) {
+                        statuses.push(resp.status)
+                    }
+                }
+                let start = time::Instant::now()
+                if let Ok(stream) = http::stream("GET", base + "/v1/test?stream=true", "", #[]) {
+                    while let Some(line) = stream.next_line() {
+                        if !line.is_empty() {
+                            frames.push(line)
+                        }
+                    }
+                }
+                elapsed.push(start.elapsed().as_millis())
+            })
+            serve(app, server)?
+        }?
+        assert_eq(statuses, #[404, 200])
+        assert(frames.len() >= 4, format("frames: {:?}", frames))
+        assert(frames.iter().all(|f| f.starts_with("data: ")), format("frames: {:?}", frames))
+        assert_eq(frames[frames.len() - 1], "data: [DONE]")
+        assert(elapsed[0] < 2000, format("stream took {} ms", elapsed[0]))
+        Ok(())
     }
 
     #[test]
-    fn lookup_override_matches_with_query_string() {
-        let resp = parse("[{\"path\":\"/v1/test\",\"body\":\"hi\"}]")
-        let got = super::lookup_override(&resp, &"/v1/test?stream=true".to_string())
-        match got {
-            Some(_) => testing::check(true, "matched with query"),
-            None => panic!("expected match"),
-        }
+    fn build_full_path_joins_with_one_slash() {
+        assert_eq(build_full_path("v1", "/models"), "/v1/models")
+        assert_eq(build_full_path("/v1/", "models"), "/v1/models")
+        assert_eq(build_full_path("api/v2", "/a/{id}"), "/api/v2/a/{id}")
     }
 
     #[test]
-    fn response_body_for_uses_default_when_unmatched() {
-        let resp = parse("[]")
-        let body = super::response_body_for(&"/v1/unknown".to_string(), &resp)
-        testing::check(body.contains("Response for /v1/unknown"), "default")
+    fn response_data_escapes_the_default_message() {
+        let data = response_data("/v1/\"q\"", Map::new())
+        assert_eq(data.compact, "{\"message\":\"Response for /v1/\\\"q\\\"\"}")
     }
 
     #[test]
-    fn response_body_for_uses_override_when_matched() {
-        let resp = parse("[{\"path\":\"/v1/foo\",\"body\":{\"k\":\"v\"}}]")
-        let body = super::response_body_for(&"/v1/foo".to_string(), &resp)
-        testing::check(body.contains("\"k\""), "override applied")
+    fn is_streaming_reads_the_first_stream_value() {
+        assert(is_streaming(#[("stream", "true")]))
+        assert(!is_streaming(#[("stream", "false"), ("stream", "true")]))
+        assert(!is_streaming(#[]))
     }
 
     #[test]
-    fn get_latency_ms_in_range() {
-        let mut state: i64 = 1
-        let mut i = 0
-        while i < 200 {
-            let pair = super::get_latency_ms(10, 20, state)
-            state = pair.0
-            testing::check(pair.1 >= 10, "lower")
-            testing::check(pair.1 <= 20, "upper")
-            i = i + 1
-        }
-    }
-
-    #[test]
-    fn get_latency_ms_collapses_when_high_le_low() {
-        let pair = super::get_latency_ms(50, 50, 1)
-        testing::check_eq(&pair.1, &50, "equal bounds")
-        let pair2 = super::get_latency_ms(50, 30, pair.0)
-        testing::check_eq(&pair2.1, &50, "inverted bounds")
-    }
-
-    #[test]
-    fn build_sse_body_terminates_with_done() {
-        let body = super::build_sse_body(&"hello world".to_string())
-        testing::check(body.contains("[DONE]"), "termination marker")
-        testing::check(body.contains("data: "), "data prefix")
-    }
-
-    #[test]
-    fn is_streaming_path_detects_query() {
-        testing::check(
-            super::is_streaming_path(&"/v1/test?stream=true".to_string()),
-            "stream flag",
-        )
-        testing::check(
-            !super::is_streaming_path(&"/v1/test".to_string()),
-            "no stream flag",
-        )
-    }
-
-    #[test]
-    fn error_body_renders_json() {
-        testing::check_eq(
-            &super::error_body("oops"),
-            &"{\"error\":\"oops\"}".to_string(),
-            "json error",
-        )
-    }
-
-    #[test]
-    fn match_route_finds_exact() {
-        let spec = parse("{\"paths\":[{\"path\":\"/test\",\"methods\":[\"GET\"]}]}")
-        let r = super::match_route(
-            &spec.paths,
-            &"v1".to_string(),
-            &"/v1/test".to_string(),
-            &"GET".to_string(),
-        )
-        match r {
-            super::RouteMatch::Found => testing::check(true, "found"),
-            super::RouteMatch::MethodNotAllowed => panic!("expected Found, got MethodNotAllowed"),
-            super::RouteMatch::NotFound => panic!("expected Found, got NotFound"),
-        }
-    }
-
-    #[test]
-    fn match_route_method_not_allowed() {
-        let spec = parse("{\"paths\":[{\"path\":\"/test\",\"methods\":[\"GET\"]}]}")
-        let r = super::match_route(
-            &spec.paths,
-            &"v1".to_string(),
-            &"/v1/test".to_string(),
-            &"POST".to_string(),
-        )
-        match r {
-            super::RouteMatch::MethodNotAllowed => testing::check(true, "405"),
-            super::RouteMatch::Found => panic!("expected 405"),
-            super::RouteMatch::NotFound => panic!("expected 405"),
-        }
-    }
-
-    #[test]
-    fn match_route_not_found() {
-        let spec = parse("{\"paths\":[{\"path\":\"/test\",\"methods\":[\"GET\"]}]}")
-        let r = super::match_route(
-            &spec.paths,
-            &"v1".to_string(),
-            &"/v1/missing".to_string(),
-            &"GET".to_string(),
-        )
-        match r {
-            super::RouteMatch::NotFound => testing::check(true, "404"),
-            super::RouteMatch::Found => panic!("expected 404"),
-            super::RouteMatch::MethodNotAllowed => panic!("expected 404"),
-        }
-    }
-
-    #[test]
-    fn match_route_with_query_string() {
-        let spec = parse("{\"paths\":[{\"path\":\"/test\",\"methods\":[\"GET\"]}]}")
-        let r = super::match_route(
-            &spec.paths,
-            &"v1".to_string(),
-            &"/v1/test?stream=true".to_string(),
-            &"GET".to_string(),
-        )
-        match r {
-            super::RouteMatch::Found => testing::check(true, "found with query"),
-            super::RouteMatch::MethodNotAllowed => panic!("expected Found"),
-            super::RouteMatch::NotFound => panic!("expected Found"),
-        }
-    }
-
-    #[test]
-    fn match_route_lowercase_methods_in_spec_get_uppercased() {
-        let spec = parse("{\"paths\":[{\"path\":\"/test\",\"methods\":[\"get\"]}]}")
-        let r = super::match_route(
-            &spec.paths,
-            &"v1".to_string(),
-            &"/v1/test".to_string(),
-            &"GET".to_string(),
-        )
-        match r {
-            super::RouteMatch::Found => testing::check(true, "case-insensitive"),
-            super::RouteMatch::MethodNotAllowed => panic!("expected Found"),
-            super::RouteMatch::NotFound => panic!("expected Found"),
-        }
+    fn split_chunks_covers_the_whole_text() {
+        let chunks = split_chunks("abcdefghij", 3)
+        assert_eq(chunks, #["abc", "def", "ghi", "j"])
+        assert_eq(split_chunks("ab", 3), #["a", "b"])
+        assert_eq(split_chunks("héllo wörld", 3).join(""), "héllo wörld")
     }
 }

@@ -1,0 +1,212 @@
+# Builds prebuilt mock-api archives for every supported platform on a version
+# tag (push a tag like v0.1.0), then publishes them to the GitHub release.
+# Each archive holds the binary plus config.yaml, spec.yaml, README.md, and
+# LICENSE, so `./mock-api` runs from the extracted directory as is.
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  # Keep in step with `gossamer-version` in project.toml.
+  GOSSAMER_VERSION: v0.63.0
+
+jobs:
+  build-linux-x86_64:
+    name: Linux x86_64
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install the Gossamer toolchain (${{ env.GOSSAMER_VERSION }})
+        run: |
+          curl -fsSL https://raw.githubusercontent.com/gossamer-lang/gossamer/main/scripts/install.sh | sh
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Read project version
+        run: echo "VERSION=$(awk -F'"' '/^version = / { print $2; exit }' project.toml)" >> "$GITHUB_ENV"
+
+      - name: Build
+        run: gos build --release --out-dir dist
+
+      - name: Smoke test the binary
+        run: scripts/smoke.sh dist/mock-api
+
+      - name: Stage tarball
+        run: |
+          BASE="mock-api-${VERSION}-linux-x86_64"
+          mkdir "$BASE"
+          cp dist/mock-api config.yaml spec.yaml README.md LICENSE "$BASE/"
+          tar -czf "${BASE}.tar.gz" "$BASE"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mock-api-linux-x86_64
+          path: mock-api-*-linux-x86_64.tar.gz
+
+  build-linux-aarch64:
+    name: Linux aarch64
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install the Gossamer toolchain (${{ env.GOSSAMER_VERSION }})
+        run: |
+          curl -fsSL https://raw.githubusercontent.com/gossamer-lang/gossamer/main/scripts/install.sh | sh
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Read project version
+        run: echo "VERSION=$(awk -F'"' '/^version = / { print $2; exit }' project.toml)" >> "$GITHUB_ENV"
+
+      # The x86_64 toolchain install does not ship the aarch64 musl runtime
+      # archive a cross build links against; it comes from the same pinned
+      # release's aarch64 tarball.
+      - name: Fetch aarch64 musl runtime archive
+        run: |
+          VER_NUM="${GOSSAMER_VERSION#v}"
+          TMP="$(mktemp -d)"
+          curl -fsSL -o "$TMP/gos-aarch64.tar.gz" \
+            "https://github.com/gossamer-lang/gossamer/releases/download/${GOSSAMER_VERSION}/gos-${VER_NUM}-linux-aarch64.tar.gz"
+          tar -xzf "$TMP/gos-aarch64.tar.gz" -C "$TMP"
+          RUNTIME_LIB="$(find "$TMP" -path '*/gos-*/libgossamer_runtime-musl.a' | head -n1)"
+          echo "GOS_RUNTIME_LIB_AARCH64_UNKNOWN_LINUX_MUSL=$RUNTIME_LIB" >> "$GITHUB_ENV"
+
+      # The musl cross link drives rustup's aarch64-musl linker component,
+      # which ubuntu-latest runners do not ship.
+      - name: Add aarch64 musl Rust target (linker)
+        run: rustup target add aarch64-unknown-linux-musl
+
+      - name: Build
+        run: gos build --release --target aarch64-unknown-linux-musl --out-dir dist
+
+      - name: Stage tarball
+        run: |
+          BASE="mock-api-${VERSION}-linux-aarch64"
+          mkdir "$BASE"
+          cp dist/mock-api config.yaml spec.yaml README.md LICENSE "$BASE/"
+          tar -czf "${BASE}.tar.gz" "$BASE"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mock-api-linux-aarch64
+          path: mock-api-*-linux-aarch64.tar.gz
+
+  build-macos:
+    name: macOS ${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: aarch64
+            runner: macos-15
+          - arch: x86_64
+            runner: macos-15-intel
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install the Gossamer toolchain (${{ env.GOSSAMER_VERSION }})
+        run: |
+          curl -fsSL https://raw.githubusercontent.com/gossamer-lang/gossamer/main/scripts/install.sh | sh
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Read project version
+        run: echo "VERSION=$(awk -F'"' '/^version = / { print $2; exit }' project.toml)" >> "$GITHUB_ENV"
+
+      # Each runner builds its own architecture natively.
+      - name: Build
+        run: gos build --release --out-dir dist
+
+      - name: Smoke test the binary
+        run: scripts/smoke.sh dist/mock-api
+
+      - name: Stage zip
+        run: |
+          BASE="mock-api-${VERSION}-macos-${{ matrix.arch }}"
+          mkdir "$BASE"
+          cp dist/mock-api config.yaml spec.yaml README.md LICENSE "$BASE/"
+          # Ad-hoc signature: macOS refuses to run a fully unsigned binary
+          # downloaded from the internet, and this one needs no identity.
+          codesign --force --sign - --timestamp=none "$BASE/mock-api"
+          zip -r "${BASE}.zip" "$BASE"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mock-api-macos-${{ matrix.arch }}
+          path: mock-api-*-macos-${{ matrix.arch }}.zip
+
+  build-windows-x86_64:
+    name: Windows x86_64
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      # The gos installer is a POSIX sh script that refuses Windows hosts, so
+      # take the Windows asset from the pinned release directly. The zip holds
+      # gos.exe with gossamer_runtime.lib beside it at its root.
+      - name: Install the Gossamer toolchain (${{ env.GOSSAMER_VERSION }})
+        shell: bash
+        run: |
+          VER_NUM="${GOSSAMER_VERSION#v}"
+          TMP="$(mktemp -d)"
+          curl -fsSL -o "$TMP/gos-windows.zip" \
+            "https://github.com/gossamer-lang/gossamer/releases/download/${GOSSAMER_VERSION}/gos-${VER_NUM}-windows-x86_64.zip"
+          7z x -y "$TMP/gos-windows.zip" -o"$TMP/gos"
+          echo "$TMP/gos" >> "$GITHUB_PATH"
+
+      - name: Read project version
+        shell: bash
+        run: echo "VERSION=$(awk -F'"' '/^version = / { print $2; exit }' project.toml)" >> "$GITHUB_ENV"
+
+      - name: Build
+        shell: bash
+        run: gos build --release --out-dir dist
+
+      - name: Stage zip
+        shell: bash
+        run: |
+          BASE="mock-api-${VERSION}-windows-x86_64"
+          mkdir "$BASE"
+          # Take the linked binary whether or not the toolchain added `.exe`.
+          BIN=dist/mock-api.exe
+          [ -f "$BIN" ] || BIN=dist/mock-api
+          cp "$BIN" "$BASE/mock-api.exe"
+          cp config.yaml spec.yaml README.md LICENSE "$BASE/"
+          7z a "$BASE.zip" "$BASE"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mock-api-windows-x86_64
+          path: mock-api-*-windows-x86_64.zip
+
+  publish:
+    name: Publish release
+    needs: [build-linux-x86_64, build-linux-aarch64, build-macos, build-windows-x86_64]
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts/
+
+      - name: Collect release files
+        run: |
+          mkdir release
+          find artifacts -type f \( -name '*.tar.gz' -o -name '*.zip' \) -exec mv {} release/ \;
+          cd release
+          sha256sum *.tar.gz *.zip > SHA256SUMS
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          generate_release_notes: true
+          files: |
+            release/*.tar.gz
+            release/*.zip
+            release/SHA256SUMS
