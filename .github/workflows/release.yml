@@ -15,7 +15,7 @@ permissions:
 
 env:
   # Keep in step with `gossamer-version` in project.toml.
-  GOSSAMER_VERSION: v0.63.1
+  GOSSAMER_VERSION: v0.64.0
 
 jobs:
   build-linux-x86_64:
