@@ -10,14 +10,14 @@ pub struct Random { state: sync::AtomicU64 }
 
 impl Random {
     /// Generator whose sequence is fixed by `seed`.
-    pub fn seeded(seed: i64) -> Random {
+    pub fn seeded(seed: u64) -> Random {
         Random { state: sync::AtomicU64::new(seed) }
     }
 
     /// Next 64 uniformly distributed bits.
     pub fn next_u64(&self) -> u64 {
-        let previous = self.state.fetch_add(GAMMA as i64)
-        let mut z = (previous as u64) +% GAMMA
+        let previous = self.state.fetch_add(GAMMA)
+        let mut z = previous +% GAMMA
         z = (z ^ (z >> 30)) *% 0xbf58_476d_1ce4_e5b9
         z = (z ^ (z >> 27)) *% 0x94d0_49bb_1331_11eb
         z ^ (z >> 31)

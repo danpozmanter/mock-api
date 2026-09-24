@@ -34,7 +34,7 @@ fn initialize(config_path: String) -> Result<App, errors::Error> {
     let spec = load_api_spec(cfg.api_spec)?
     println("Loaded API spec with {} paths", spec.paths.len())
     let overrides = cfg.responses.keys()
-    let app = App::new(cfg, spec, Random::seeded(time::now_ms()))?
+    let app = App::new(cfg, spec, Random::seeded(time::now_ms() as u64))?
     for (method, path) in app.endpoints() {
         println("Registered endpoint: {} {}", method, path)
     }
